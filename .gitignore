@@ -1,0 +1,12 @@
+
+.streamlit/secrets.toml
+*.exe
+*.pptx
+bug_tracker.db
+.runtime/
+
+.streamlit/secrets.toml
+*.exe
+*.pptx
+bug_tracker.db
+.runtime/

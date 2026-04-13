@@ -1,0 +1,11 @@
+streamlit==1.49.1
+sqlalchemy==2.0.43
+pydantic[email]==2.11.7
+pydantic-settings==2.10.1
+passlib==1.7.4
+python-jose[cryptography]==3.5.0
+openai>=1.0.0,<2.0.0
+requests==2.32.5
+pypdf>=5.0.0
+pgvector>=0.3.6
+psycopg[binary]>=3.2.9
