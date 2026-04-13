@@ -9,3 +9,4 @@ requests==2.32.5
 pypdf>=5.0.0
 pgvector>=0.3.6
 psycopg[binary]>=3.2.9
+Authlib 
