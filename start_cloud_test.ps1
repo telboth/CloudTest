@@ -49,7 +49,7 @@ if ($UseSqliteFallback) {
     $resolvedDatabaseUrl = "postgresql+psycopg://bugapp:bugapp@localhost:5432/bug_ticket_system"
 }
 [System.Environment]::SetEnvironmentVariable("DATABASE_URL", $resolvedDatabaseUrl, "Process")
-Write-Host "Cloud_test DATABASE_URL: $resolvedDatabaseUrl"
+Write-Host "CloudTest DATABASE_URL: $resolvedDatabaseUrl"
 if ($resolvedDatabaseUrl -like "postgresql*") {
     Write-Host "PostgreSQL-modus aktivert (anbefalt for cloud/samtidige brukere)."
 } elseif ($resolvedDatabaseUrl -like "sqlite*") {
@@ -92,6 +92,7 @@ foreach ($app in $apps) {
 }
 
 Write-Host ""
-Write-Host "Cloud_test startet:"
+Write-Host "CloudTest startet:"
 Write-Host "  Unified:  http://localhost:8601"
 Write-Host "  Logger:   $logsDir"
+

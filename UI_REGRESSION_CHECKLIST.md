@@ -1,16 +1,16 @@
-# Cloud_test UI Regression Checklist
+# CloudTest UI Regression Checklist
 
-Bruk denne sjekklisten før merge/deploy av `Cloud_test`.
+Bruk denne sjekklisten før merge/deploy av `CloudTest`.
 
 ## 0. Forutsetninger
 
 1. Start appen:
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\Cloud_test\start_cloud_test.ps1
+powershell -ExecutionPolicy Bypass -File .\CloudTest\start_cloud_test.ps1
 ```
 2. Kjør hardening checks:
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\Cloud_test\run_hardening_checks.ps1
+powershell -ExecutionPolicy Bypass -File .\CloudTest\run_hardening_checks.ps1
 ```
 3. Åpne `http://localhost:8601`.
 
@@ -65,8 +65,8 @@ powershell -ExecutionPolicy Bypass -File .\Cloud_test\run_hardening_checks.ps1
 1. Oppdater visning i sidebaren og bekreft at data vises uten feil.
 2. Verifiser at ingen traceback vises i UI under normal bruk.
 3. Sjekk logger:
-   - `Cloud_test/.runtime/logs/unified.err.log`
-   - `Cloud_test/.runtime/logs/unified.out.log`
+   - `CloudTest/.runtime/logs/unified.err.log`
+   - `CloudTest/.runtime/logs/unified.out.log`
 4. Bekreft at appen fortsatt starter/stoppes normalt.
 
 ## 6. Godkjenning
@@ -76,3 +76,4 @@ powershell -ExecutionPolicy Bypass -File .\Cloud_test\run_hardening_checks.ps1
 - [ ] Assignee-scenario passerte
 - [ ] Admin-scenario passerte
 - [ ] Ingen blokkerende feil i logger
+

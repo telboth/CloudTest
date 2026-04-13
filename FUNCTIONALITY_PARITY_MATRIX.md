@@ -1,8 +1,8 @@
-# Cloud_test Functionality Parity Matrix (Phase 1)
+# CloudTest Functionality Parity Matrix (Phase 1)
 
 ## Goal
 
-Bring `Cloud_test/unified_app.py` to feature parity with the original 3 apps:
+Bring `CloudTest/unified_app.py` to feature parity with the original 3 apps:
 
 - `streamlit_apps/reporter_app.py`
 - `streamlit_apps/assignee_app.py`
@@ -17,9 +17,9 @@ Bring `Cloud_test/unified_app.py` to feature parity with the original 3 apps:
 - Drop: Ollama/local LLM options.
 - Keep: single unified app with role-based pages (Reporter/Assignee/Admin).
 
-## Current baseline (Cloud_test)
+## Current baseline (CloudTest)
 
-Already implemented in `Cloud_test/unified_app.py`:
+Already implemented in `CloudTest/unified_app.py`:
 
 - Basic auth gate (OIDC + optional local fallback).
 - Create/read/update/delete bugs.
@@ -39,7 +39,7 @@ Missing from original apps:
 
 ## Parity matrix
 
-| Area | Reporter | Assignee | Admin | Current in Cloud_test | Decision | Priority |
+| Area | Reporter | Assignee | Admin | Current in CloudTest | Decision | Priority |
 |---|---|---|---|---|---|---|
 | Auth + role mapping | Yes | Yes | Yes | Partial | Keep | P0 |
 | Shared styling/layout helpers | Yes | Yes | Yes | Minimal | Keep | P1 |
@@ -65,7 +65,7 @@ Missing from original apps:
 ## Implementation waves (recommended)
 
 1. Shared foundation wave  
-   Port core helpers from `common.py` into `Cloud_test`-local modules, but remove backend-only and dropped features (DevOps/Ollama).
+   Port core helpers from `common.py` into `CloudTest`-local modules, but remove backend-only and dropped features (DevOps/Ollama).
 
 2. Reporter parity wave  
    Implement create/edit flow parity first (AI draft, typeahead, similar bugs, attachments, tags, notify, search/sort/filter).
@@ -88,8 +88,8 @@ Missing from original apps:
 ## Progress log
 
 - 2026-04-13: Phase 2 started.
-  - Added `Cloud_test/foundation.py` for shared style/cache/search/filter/sort/system-panel helpers.
-  - Wired shared foundation into `Cloud_test/unified_app.py` for all role pages.
+  - Added `CloudTest/foundation.py` for shared style/cache/search/filter/sort/system-panel helpers.
+  - Wired shared foundation into `CloudTest/unified_app.py` for all role pages.
 - 2026-04-13: Phase 3 started (Reporter parity wave, del 1).
   - Added Reporter AI draft flow (`Bruk AI til å fylle ut felter`) with OpenAI and robust error handling.
   - Added similar-bug helper flow in Reporter.
@@ -105,13 +105,13 @@ Missing from original apps:
   - Switched reporter assignee edit to selectable assignable list (with fallback option).
   - Added safe queue/rerun flow for clearing "Ny oppdatering fra rapportør" input after save.
 - 2026-04-13: Phase 3 continued (Reporter parity wave, del 4).
-  - Added `Avanserte AI-detaljer` panel in Cloud_test reporter AI section.
+  - Added `Avanserte AI-detaljer` panel in CloudTest reporter AI section.
   - Added AI file text extraction (text/PDF) and extraction summary for draft generation.
   - Added stricter reporter create validation (minimum title/description, assignee whitelist, notify email checks).
 - 2026-04-13: Phase 4 started (Assignee parity wave, del 1).
   - Added `AI: Foreslå løsning` for assignee bugs with short suggestion output based on bug context + conversation.
   - Added safe queue/rerun flow for `Sett inn forslag` into arbeidsnotater (avoids Streamlit session-state widget mutation errors).
-  - Added direct `Sentiment - analyse` action in Cloud_test assignee with persisted `sentiment_label` and `sentiment_summary`.
+  - Added direct `Sentiment - analyse` action in CloudTest assignee with persisted `sentiment_label` and `sentiment_summary`.
 - 2026-04-13: Phase 4 continued (Assignee parity wave, del 2).
   - Added sidebar `Arbeidskø` summary for assignee view (open/in_progress/resolved/critical/negative sentiment counts).
   - Added sidebar `Mulige duplikater` tool with `Se etter duplikater` scan on current assignee view.
@@ -133,15 +133,15 @@ Missing from original apps:
   - Added admin editing support for `Kategori`, `Rapportør-tilfredshet` and optional description update.
   - Extended update logic to persist `reporter_satisfaction` in unified local workflow.
 - 2026-04-13: Phase 6 started (Hardening + parity test wave).
-  - Added `Cloud_test/parity_smoke_test.py` with assertions for core parity helpers (sentiment, email parsing, duplicate detection, admin date parsing, stale/aging logic).
-  - Added `Cloud_test/run_hardening_checks.ps1` to run compile + smoke checks in one command.
-  - Updated `Cloud_test/README.md` with a dedicated hardening-check command.
+  - Added `CloudTest/parity_smoke_test.py` with assertions for core parity helpers (sentiment, email parsing, duplicate detection, admin date parsing, stale/aging logic).
+  - Added `CloudTest/run_hardening_checks.ps1` to run compile + smoke checks in one command.
+  - Updated `CloudTest/README.md` with a dedicated hardening-check command.
 - 2026-04-13: Phase 6 continued (Hardening + parity test wave, del 2).
-  - Added `Cloud_test/UI_REGRESSION_CHECKLIST.md` with role-based manual regression checks for Reporter/Assignee/Admin.
-  - Updated `Cloud_test/README.md` with a direct reference to the UI regression checklist.
+  - Added `CloudTest/UI_REGRESSION_CHECKLIST.md` with role-based manual regression checks for Reporter/Assignee/Admin.
+  - Updated `CloudTest/README.md` with a direct reference to the UI regression checklist.
 - 2026-04-13: Phase 6 continued (Hardening + parity test wave, del 3).
-  - Added `Cloud_test/UI_REGRESSION_REPORT.md` for per-run tracking of automated checks and manual UI verification status.
-  - Updated `Cloud_test/README.md` with report-file reference to standardize regression sign-off.
+  - Added `CloudTest/UI_REGRESSION_REPORT.md` for per-run tracking of automated checks and manual UI verification status.
+  - Updated `CloudTest/README.md` with report-file reference to standardize regression sign-off.
 - 2026-04-13: Phase 6 continued (Hardening + parity wave, del 4).
   - Added local background job framework in `unified_app.py` (start/track/poll/finalize) and moved key AI actions to async-capable flow.
   - Added bug summary generation flow (`Oppsummer bug`) for Assignee/Admin with persisted `bug_summary`.
@@ -150,7 +150,8 @@ Missing from original apps:
   - Added delete confirmation flow for bug and duplicate deletions in Assignee/Admin.
   - Improved conversation/history rendering options (collapsed/compact and dedupe of consecutive duplicate comments).
 - 2026-04-13: Phase 7 started (modularisering og robusthet).
-  - Moved auth UI flow into `Cloud_test/auth_ui.py` and replaced in-app auth implementation with a single wrapper in `unified_app.py`.
-  - Moved OpenAI/JSON AI client logic into `Cloud_test/ai_client.py` and kept thin wrappers in `unified_app.py`.
-  - Added shared user-facing error formatting in `Cloud_test/error_utils.py` for consistent fallback messages.
-  - Moved background job runtime internals into `Cloud_test/job_runtime.py` with stable wrapper API in `unified_app.py`.
+  - Moved auth UI flow into `CloudTest/auth_ui.py` and replaced in-app auth implementation with a single wrapper in `unified_app.py`.
+  - Moved OpenAI/JSON AI client logic into `CloudTest/ai_client.py` and kept thin wrappers in `unified_app.py`.
+  - Added shared user-facing error formatting in `CloudTest/error_utils.py` for consistent fallback messages.
+  - Moved background job runtime internals into `CloudTest/job_runtime.py` with stable wrapper API in `unified_app.py`.
+

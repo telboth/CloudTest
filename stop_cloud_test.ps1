@@ -31,4 +31,5 @@ if (Test-Path $authPendingDir) {
     }
 }
 
-Write-Host "Cloud_test stoppet."
+Write-Host "CloudTest stoppet."
+

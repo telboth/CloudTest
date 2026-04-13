@@ -17,8 +17,10 @@ from uuid import uuid4
 
 CLOUD_ROOT = Path(__file__).resolve().parent
 PROJECT_ROOT = CLOUD_ROOT.parent
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
+for candidate in (CLOUD_ROOT, PROJECT_ROOT):
+    candidate_str = str(candidate)
+    if candidate_str not in sys.path:
+        sys.path.insert(0, candidate_str)
 
 import streamlit as st
 from sqlalchemy import func, select, text
@@ -411,13 +413,13 @@ def _validate_cloud_database_profile() -> None:
     if not settings.database_is_postgresql:
         if settings.database_is_sqlite:
             if _cloud_sqlite_fallback_enabled():
-                logger.warning("Cloud_test is running with SQLite fallback (explicitly enabled).")
+                logger.warning("CloudTest is running with SQLite fallback (explicitly enabled).")
                 return
             if not _running_on_streamlit_cloud():
-                logger.warning("Cloud_test is running with SQLite fallback (auto-enabled for local run).")
+                logger.warning("CloudTest is running with SQLite fallback (auto-enabled for local run).")
                 return
         raise RuntimeError(
-            "Cloud_test krever PostgreSQL i cloud. Lokalt kan du bruke SQLite fallback med "
+            "CloudTest krever PostgreSQL i cloud. Lokalt kan du bruke SQLite fallback med "
             "'start_cloud_test.ps1 -UseSqliteFallback' eller sette CLOUD_TEST_ALLOW_SQLITE_FALLBACK=true."
         )
 
@@ -2664,7 +2666,7 @@ def main() -> None:
     try:
         _init_local_data()
     except Exception as exc:
-        logger.exception("Cloud_test startup failed")
+        logger.exception("CloudTest startup failed")
         detail = str(exc).strip()
         if detail:
             st.error(f"Oppstart feilet: {exc.__class__.__name__}: {detail}")
@@ -2704,4 +2706,5 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
 

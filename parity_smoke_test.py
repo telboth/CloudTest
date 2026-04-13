@@ -9,7 +9,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from app.models.bug import Bug  # noqa: E402
-from Cloud_test import unified_app as app  # noqa: E402
+from CloudTest import unified_app as app  # noqa: E402
 
 
 def _make_bug(
@@ -82,8 +82,9 @@ def run() -> None:
     _assert(app._is_stale_bug(stale_bug), "Stale bug detection failed")
     _assert(app._is_critical_aging_bug(critical_aging_bug), "Critical aging bug detection failed")
 
-    print("Cloud_test parity smoke test: OK")
+    print("CloudTest parity smoke test: OK")
 
 
 if __name__ == "__main__":
     run()
+

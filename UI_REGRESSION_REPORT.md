@@ -1,4 +1,4 @@
-# Cloud_test UI Regression Report
+# CloudTest UI Regression Report
 
 Siste oppdatering: 2026-04-13 09:07:51 +02:00
 
@@ -6,13 +6,13 @@ Siste oppdatering: 2026-04-13 09:07:51 +02:00
 
 ### 1. Automatiske checks
 
-- [x] `powershell -ExecutionPolicy Bypass -File .\Cloud_test\run_hardening_checks.ps1`
+- [x] `powershell -ExecutionPolicy Bypass -File .\CloudTest\run_hardening_checks.ps1`
 - [x] Compile check: OK
-- [x] Smoke test: `Cloud_test parity smoke test: OK`
+- [x] Smoke test: `CloudTest parity smoke test: OK`
 
 ### 2. Manuell UI-regresjon (Reporter)
 
-Referanse: `Cloud_test/UI_REGRESSION_CHECKLIST.md` seksjon 2.
+Referanse: `CloudTest/UI_REGRESSION_CHECKLIST.md` seksjon 2.
 
 - [ ] Opprett bug med metadata
 - [ ] AI-fylling + avanserte AI-detaljer
@@ -22,7 +22,7 @@ Referanse: `Cloud_test/UI_REGRESSION_CHECKLIST.md` seksjon 2.
 
 ### 3. Manuell UI-regresjon (Assignee)
 
-Referanse: `Cloud_test/UI_REGRESSION_CHECKLIST.md` seksjon 3.
+Referanse: `CloudTest/UI_REGRESSION_CHECKLIST.md` seksjon 3.
 
 - [ ] `AI: Foreslå løsning` + `Sett inn forslag`
 - [ ] `Sentiment - analyse` viser `:-) / :-| / :-(`
@@ -32,7 +32,7 @@ Referanse: `Cloud_test/UI_REGRESSION_CHECKLIST.md` seksjon 3.
 
 ### 4. Manuell UI-regresjon (Admin)
 
-Referanse: `Cloud_test/UI_REGRESSION_CHECKLIST.md` seksjon 4.
+Referanse: `CloudTest/UI_REGRESSION_CHECKLIST.md` seksjon 4.
 
 - [ ] Dashboard-kort viser tall
 - [ ] Admin-filtre fungerer
@@ -45,3 +45,4 @@ Referanse: `Cloud_test/UI_REGRESSION_CHECKLIST.md` seksjon 4.
 
 - Ingen automatiske feil i denne kjøringen.
 - Manuelle tester ikke fullført ennå.
+
