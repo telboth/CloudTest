@@ -91,16 +91,18 @@ def _bootstrap_cloud_test_env_from_secrets() -> None:
     running_on_streamlit_cloud = _truthy(os.getenv("STREAMLIT_CLOUD"))
     allow_sqlite_fallback = _truthy(os.getenv("CLOUD_TEST_ALLOW_SQLITE_FALLBACK"))
     database_url = str(os.getenv("DATABASE_URL") or "").strip()
-    if (
-        running_on_streamlit_cloud
-        and allow_sqlite_fallback
-        and database_url
-        and database_url.casefold().startswith(("postgresql", "postgres"))
-    ):
-        host = _host_from_database_url(database_url)
-        if host in {"localhost", "127.0.0.1", "::1"}:
-            sqlite_url = f"sqlite:///{(CLOUD_ROOT / 'bug_tracker_cloud.db').as_posix()}"
+    if running_on_streamlit_cloud:
+        sqlite_url = f"sqlite:///{(CLOUD_ROOT / 'bug_tracker_cloud.db').as_posix()}"
+        if not database_url:
             os.environ["DATABASE_URL"] = sqlite_url
+            os.environ.setdefault("CLOUD_TEST_ALLOW_SQLITE_FALLBACK", "true")
+        elif database_url.casefold().startswith(("postgresql", "postgres")):
+            host = _host_from_database_url(database_url)
+            if host in {"localhost", "127.0.0.1", "::1"}:
+                os.environ["DATABASE_URL"] = sqlite_url
+                os.environ.setdefault("CLOUD_TEST_ALLOW_SQLITE_FALLBACK", "true")
+        elif allow_sqlite_fallback and database_url.casefold().startswith("sqlite"):
+            os.environ.setdefault("CLOUD_TEST_ALLOW_SQLITE_FALLBACK", "true")
 
 
 _bootstrap_cloud_test_env_from_secrets()
