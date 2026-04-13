@@ -1,9 +1,9 @@
-# Cloud_test (Unified Streamlit App)
+# CloudTest (Unified Streamlit App)
 
-Cloud_test er en backend-los variant av bugsystemet der alt kjorer i en Streamlit-app:
+CloudTest er en backend-los variant av bugsystemet der alt kjorer i en Streamlit-app:
 
 - En app: `unified_app.py`
-- PostgreSQL + pgvector (standardprofil i Cloud_test)
+- PostgreSQL + pgvector (standardprofil i CloudTest)
 - Vedlegg/lagring via backend-abstraksjon (`ATTACHMENT_STORAGE_BACKEND`, default `filesystem`)
 - Microsoft Entra via Streamlit OIDC (`st.login`)
 
@@ -12,19 +12,19 @@ Cloud_test er en backend-los variant av bugsystemet der alt kjorer i en Streamli
 Standard (cloud/minimal):
 
 ```powershell
-pip install -r .\Cloud_test\requirements.txt
+pip install -r .\CloudTest\requirements.txt
 ```
 
 Valgfri lokal AI/OCR (tyngre pakker):
 
 ```powershell
-pip install -r .\Cloud_test\requirements-optional-local-ai.txt
+pip install -r .\CloudTest\requirements-optional-local-ai.txt
 ```
 
 ## Start
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\Cloud_test\start_cloud_test.ps1
+powershell -ExecutionPolicy Bypass -File .\CloudTest\start_cloud_test.ps1
 ```
 
 Starter med PostgreSQL som standard (`DATABASE_URL`), og skriver valgt DB-url ved oppstart.
@@ -32,13 +32,13 @@ Starter med PostgreSQL som standard (`DATABASE_URL`), og skriver valgt DB-url ve
 Kortkommando:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\Cloud_test\start_apps.ps1
+powershell -ExecutionPolicy Bypass -File .\CloudTest\start_apps.ps1
 ```
 
 Valgfri SQLite fallback (kun for lokal test, ikke cloud):
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\Cloud_test\start_cloud_test.ps1 -UseSqliteFallback
+powershell -ExecutionPolicy Bypass -File .\CloudTest\start_cloud_test.ps1 -UseSqliteFallback
 ```
 
 Dette setter `CLOUD_TEST_ALLOW_SQLITE_FALLBACK=true` for prosessen, slik at appen kan starte uten PostgreSQL lokalt.
@@ -47,7 +47,7 @@ Hvis du starter med `streamlit run` direkte lokalt, tillates SQLite fallback aut
 ## Stopp
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\Cloud_test\stop_cloud_test.ps1
+powershell -ExecutionPolicy Bypass -File .\CloudTest\stop_cloud_test.ps1
 ```
 
 ## URL
@@ -59,7 +59,7 @@ powershell -ExecutionPolicy Bypass -File .\Cloud_test\stop_cloud_test.ps1
 Kjor smoke-test og compile-sjekk:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\Cloud_test\run_hardening_checks.ps1
+powershell -ExecutionPolicy Bypass -File .\CloudTest\run_hardening_checks.ps1
 ```
 
 Dette sjekker blant annet:
@@ -73,12 +73,12 @@ Dette sjekker blant annet:
 
 Kjor rollebasert sjekkliste for Reporter/Assignee/Admin:
 
-- `Cloud_test/UI_REGRESSION_CHECKLIST.md`
-- Logg resultat per kjoring i: `Cloud_test/UI_REGRESSION_REPORT.md`
+- `CloudTest/UI_REGRESSION_CHECKLIST.md`
+- Logg resultat per kjoring i: `CloudTest/UI_REGRESSION_REPORT.md`
 
 ## Entra (OIDC) konfig
 
-Bruk `Cloud_test/secrets.toml.example` som mal for `.streamlit/secrets.toml`.
+Bruk `CloudTest/secrets.toml.example` som mal for `.streamlit/secrets.toml`.
 
 Viktige felter:
 
@@ -102,14 +102,15 @@ Eksempel:
 
 `postgresql+psycopg://USER:PASSWORD@HOST:5432/DB_NAME?sslmode=require`
 
-`ATTACHMENT_STORAGE_BACKEND` kan settes, men `filesystem` er standard og brukes av Cloud_test i dag.
+`ATTACHMENT_STORAGE_BACKEND` kan settes, men `filesystem` er standard og brukes av CloudTest i dag.
 
-I Cloud_test-modus kreves PostgreSQL som standard. For lokal dev kan du eksplisitt tillate SQLite med `CLOUD_TEST_ALLOW_SQLITE_FALLBACK=true` (settes automatisk av `-UseSqliteFallback`).
+I CloudTest-modus kreves PostgreSQL som standard. For lokal dev kan du eksplisitt tillate SQLite med `CLOUD_TEST_ALLOW_SQLITE_FALLBACK=true` (settes automatisk av `-UseSqliteFallback`).
 Hvis PostgreSQL mangler `vector`-extension eller brukeren ikke har rettighet til `CREATE EXTENSION`, starter appen likevel med tekst-basert fallback for embeddings.
 
 ## Sikkerhetsnotater
 
-- Ikke commit `Cloud_test/.streamlit/secrets.toml`.
-- Lokal fallback-login er av som standard i Cloud_test (`CLOUD_TEST_ALLOW_LOCAL_LOGIN=false`).
+- Ikke commit `CloudTest/.streamlit/secrets.toml`.
+- Lokal fallback-login er av som standard i CloudTest (`CLOUD_TEST_ALLOW_LOCAL_LOGIN=false`).
 - Hvis du aktiverer lokal fallback-login, sett et sterkt `DEFAULT_ADMIN_PASSWORD`.
 - Roter `client_secret` dersom det har blitt eksponert i lokal fil eller logg.
+
