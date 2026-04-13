@@ -79,6 +79,29 @@ def _bootstrap_cloud_test_env_from_secrets() -> None:
         if value is not None and str(value).strip():
             os.environ[env_key] = str(value).strip()
 
+    def _truthy(value: str | None) -> bool:
+        return str(value or "").strip().casefold() in {"1", "true", "yes", "on"}
+
+    def _host_from_database_url(database_url: str) -> str:
+        try:
+            return str(urlparse(database_url).hostname or "").strip().casefold()
+        except Exception:
+            return ""
+
+    running_on_streamlit_cloud = _truthy(os.getenv("STREAMLIT_CLOUD"))
+    allow_sqlite_fallback = _truthy(os.getenv("CLOUD_TEST_ALLOW_SQLITE_FALLBACK"))
+    database_url = str(os.getenv("DATABASE_URL") or "").strip()
+    if (
+        running_on_streamlit_cloud
+        and allow_sqlite_fallback
+        and database_url
+        and database_url.casefold().startswith(("postgresql", "postgres"))
+    ):
+        host = _host_from_database_url(database_url)
+        if host in {"localhost", "127.0.0.1", "::1"}:
+            sqlite_url = f"sqlite:///{(CLOUD_ROOT / 'bug_tracker_cloud.db').as_posix()}"
+            os.environ["DATABASE_URL"] = sqlite_url
+
 
 _bootstrap_cloud_test_env_from_secrets()
 
