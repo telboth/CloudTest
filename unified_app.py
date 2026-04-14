@@ -1345,7 +1345,7 @@ def _run_bug_summary(user: dict[str, str], bug_id: int) -> str | None:
     return None
 
 
-def _apply_reporter_ai_draft(payload: dict) -> None:
+def _apply_reporter_ai_draft(payload: dict, *, allowed_assignees: set[str] | None = None) -> None:
     st.session_state["reporter_create_title"] = str(payload.get("title", "") or "").strip()
     st.session_state["reporter_create_description"] = str(payload.get("description", "") or "").strip()
 
@@ -1360,8 +1360,17 @@ def _apply_reporter_ai_draft(payload: dict) -> None:
         st.session_state["reporter_create_severity"] = severity
     if category in CATEGORY_OPTIONS:
         st.session_state["reporter_create_category"] = category
-    if assignee_email:
+    normalized_allowed_assignees = {
+        _normalize_email(item)
+        for item in (allowed_assignees or set())
+        if _normalize_email(item)
+    }
+    if assignee_email and (
+        not normalized_allowed_assignees or assignee_email in normalized_allowed_assignees
+    ):
         st.session_state["reporter_create_assignee"] = assignee_email
+    else:
+        st.session_state["reporter_create_assignee"] = ""
 
     if isinstance(notify_value, list):
         st.session_state["reporter_create_notify_emails"] = ", ".join(_parse_email_list(", ".join(str(x) for x in notify_value)))
