@@ -9,7 +9,6 @@ from app.core.database import engine
 from app.services.ai_provider import get_ai_provider_status, get_embedding_provider_status
 from app.services.config_validation import validate_runtime_config
 from app.services.search import get_search_telemetry_snapshot
-from app.services.azure_devops import azure_devops_enabled
 
 
 def get_live_health() -> dict[str, Any]:
@@ -26,8 +25,6 @@ def get_ready_health() -> dict[str, Any]:
         "ai_text": _ai_text_check(),
         "embeddings": _embedding_check(),
         "search": _search_check(),
-        "entra": _entra_check(),
-        "azure_devops": _azure_devops_check(),
     }
 
     overall_status = "ok"
@@ -132,34 +129,4 @@ def _search_check() -> dict[str, Any]:
         "status": "ok",
         "detail": "Search telemetry snapshot.",
         "telemetry": telemetry,
-    }
-
-
-def _entra_check() -> dict[str, Any]:
-    if settings.entra_enabled:
-        return {
-            "status": "ok",
-            "detail": "Entra ID is configured.",
-        }
-    return {
-        "status": "degraded",
-        "detail": "Entra ID is not configured.",
-    }
-
-
-def _azure_devops_check() -> dict[str, Any]:
-    configured = azure_devops_enabled()
-    if not configured:
-        return {
-            "status": "degraded",
-            "detail": "Azure DevOps org/project is not configured.",
-        }
-    if not settings.azure_devops_pat:
-        return {
-            "status": "degraded",
-            "detail": "Azure DevOps is configured, but PAT is missing.",
-        }
-    return {
-        "status": "ok",
-        "detail": "Azure DevOps configuration is present.",
     }

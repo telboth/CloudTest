@@ -4,12 +4,16 @@ import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[1]
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
+CLOUD_ROOT = Path(__file__).resolve().parent
+PROJECT_ROOT = CLOUD_ROOT.parent
+for item in (str(PROJECT_ROOT), str(CLOUD_ROOT)):
+    while item in sys.path:
+        sys.path.remove(item)
+for item in (str(PROJECT_ROOT), str(CLOUD_ROOT)):
+    sys.path.insert(0, item)
 
 from app.models.bug import Bug  # noqa: E402
-from CloudTest import unified_app as app  # noqa: E402
+import unified_app as app  # noqa: E402
 
 
 def _make_bug(

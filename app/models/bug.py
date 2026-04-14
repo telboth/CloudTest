@@ -84,6 +84,8 @@ class Bug(Base):
         onupdate=func.now(),
     )
     closed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+    deleted_by: Mapped[str | None] = mapped_column(String(255), nullable=True)
 
     reporter = relationship("User", foreign_keys=[reporter_id], back_populates="reported_bugs")
     assignee = relationship("User", foreign_keys=[assignee_id], back_populates="assigned_bugs")
@@ -142,6 +144,9 @@ class BugSearchIndex(Base):
     embedding_model: Mapped[str | None] = mapped_column(String(255), nullable=True)
     embedding_dimensions: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
     search_text: Mapped[str] = mapped_column(Text)
+    needs_reindex: Mapped[int] = mapped_column(Integer, nullable=False, default=1, server_default="1", index=True)
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    indexed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
     embedding: Mapped[list[float] | None] = mapped_column(EmbeddingType(), nullable=True)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
@@ -161,3 +166,15 @@ class BugViewState(Base):
     last_viewed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)
 
     bug = relationship("Bug", back_populates="view_states")
+
+
+class AppRuntimeMeta(Base):
+    __tablename__ = "app_runtime_meta"
+
+    key: Mapped[str] = mapped_column(String(100), primary_key=True)
+    value: Mapped[str | None] = mapped_column(Text, nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+    )

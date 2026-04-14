@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 from typing import Any
 from urllib.parse import urlparse
 
@@ -13,9 +12,6 @@ def validate_runtime_config() -> dict[str, Any]:
         "database": _database_check(),
         "ai_text": _ai_text_check(),
         "embeddings": _embedding_check(),
-        "entra": _entra_check(),
-        "azure_devops": _azure_devops_check(),
-        "urls": _url_check(),
     }
 
     status = "ok"
@@ -60,35 +56,11 @@ def _database_check() -> dict[str, str]:
             "detail": "DATABASE_URL is missing.",
         }
 
-    cloud_mode = str(os.getenv("STREAMLIT_CLOUD_TEST_MODE", "")).strip().casefold() in {"1", "true", "yes", "on"}
-    running_on_streamlit_cloud = str(os.getenv("STREAMLIT_CLOUD", "")).strip().casefold() in {"1", "true", "yes", "on"}
-    allow_sqlite_fallback = str(os.getenv("CLOUD_TEST_ALLOW_SQLITE_FALLBACK", "")).strip().casefold() in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }
     backend = settings.database_backend
-    if cloud_mode and backend != "postgresql":
-        if backend == "sqlite" and allow_sqlite_fallback:
-            return {
-                "status": "degraded",
-                "detail": (
-                    "CloudTest mode is running on explicit SQLite fallback. "
-                    "Use PostgreSQL for cloud/stable multi-user runtime."
-                ),
-            }
-        if backend == "sqlite" and not running_on_streamlit_cloud:
-            return {
-                "status": "degraded",
-                "detail": (
-                    "CloudTest mode is running on local auto SQLite fallback. "
-                    "Use PostgreSQL for cloud/stable multi-user runtime."
-                ),
-            }
+    if backend == "sqlite":
         return {
-            "status": "error",
-            "detail": "CloudTest mode requires PostgreSQL. Update DATABASE_URL to a postgresql+psycopg URL.",
+            "status": "ok",
+            "detail": "SQLite-profil aktiv (lokal/lettvektsdrift).",
         }
 
     if backend == "postgresql":
@@ -103,6 +75,12 @@ def _database_check() -> dict[str, str]:
                     "For cloud databases, append '?sslmode=require' to DATABASE_URL."
                 ),
             }
+
+    if backend == "other":
+        return {
+            "status": "degraded",
+            "detail": f"Ukjent database-backend i DATABASE_URL ({backend}).",
+        }
 
     return {
         "status": "ok",
@@ -119,8 +97,8 @@ def _ai_text_check() -> dict[str, str]:
         }
     if provider == "openai" and not settings.openai_api_key:
         return {
-            "status": "error",
-            "detail": "AI_PROVIDER is set to OpenAI, but OPENAI_API_KEY is missing.",
+            "status": "degraded",
+            "detail": "AI_PROVIDER=OpenAI, men OPENAI_API_KEY mangler. AI-funksjoner blir utilgjengelige.",
         }
     if provider == "ollama" and not settings.ollama_base_url:
         return {
@@ -142,8 +120,8 @@ def _embedding_check() -> dict[str, str]:
         }
     if provider == "openai" and not settings.openai_api_key:
         return {
-            "status": "error",
-            "detail": "EMBEDDING_PROVIDER is set to OpenAI, but OPENAI_API_KEY is missing.",
+            "status": "degraded",
+            "detail": "EMBEDDING_PROVIDER=OpenAI, men OPENAI_API_KEY mangler. Vektorsøk blir begrenset/fallback.",
         }
     if provider == "local" and not settings.local_embedding_model:
         return {
@@ -161,86 +139,4 @@ def _embedding_check() -> dict[str, str]:
     }
 
 
-def _entra_check() -> dict[str, str]:
-    parts = [
-        bool(settings.entra_tenant_id),
-        bool(settings.entra_client_id),
-        bool(settings.entra_client_secret),
-    ]
-    configured_count = sum(1 for part in parts if part)
-    if configured_count == 0:
-        return {
-            "status": "degraded",
-            "detail": "Entra ID is not configured.",
-        }
-    if configured_count != len(parts):
-        return {
-            "status": "error",
-            "detail": "Entra ID configuration is incomplete. Set tenant, client ID and client secret together.",
-        }
-    return {
-        "status": "ok",
-        "detail": "Entra ID configuration is complete.",
-    }
-
-
-def _azure_devops_check() -> dict[str, str]:
-    has_org = bool(settings.azure_devops_org)
-    has_project = bool(settings.azure_devops_project)
-    has_pat = bool(settings.azure_devops_pat)
-
-    if not has_org and not has_project and not has_pat:
-        return {
-            "status": "degraded",
-            "detail": "Azure DevOps is not configured.",
-        }
-    if has_org != has_project:
-        return {
-            "status": "error",
-            "detail": "Azure DevOps configuration is incomplete. Set AZURE_DEVOPS_ORG and AZURE_DEVOPS_PROJECT together.",
-        }
-    if has_org and has_project and not has_pat:
-        return {
-            "status": "degraded",
-            "detail": "Azure DevOps org/project is configured, but AZURE_DEVOPS_PAT is missing.",
-        }
-    return {
-        "status": "ok",
-        "detail": "Azure DevOps configuration looks valid.",
-    }
-
-
-def _url_check() -> dict[str, str]:
-    urls = [
-        ("API_BASE_URL", settings.api_base_url),
-        ("ENTRA_REDIRECT_URI", settings.entra_redirect_uri),
-        ("STREAMLIT_REPORTER_URL", settings.streamlit_reporter_url),
-        ("STREAMLIT_ASSIGNEE_URL", settings.streamlit_assignee_url),
-        ("STREAMLIT_ADMIN_URL", settings.streamlit_admin_url),
-    ]
-
-    invalid: list[str] = []
-    for name, value in urls:
-        parsed = urlparse(value)
-        if not parsed.scheme or not parsed.netloc:
-            invalid.append(name)
-
-    if invalid:
-        return {
-            "status": "error",
-            "detail": f"These URL settings are invalid: {', '.join(invalid)}.",
-        }
-
-    api_url = urlparse(settings.api_base_url)
-    entra_url = urlparse(settings.entra_redirect_uri)
-    if (api_url.hostname, api_url.port) != (entra_url.hostname, entra_url.port):
-        return {
-            "status": "degraded",
-            "detail": "API_BASE_URL and ENTRA_REDIRECT_URI use different host/port combinations.",
-        }
-
-    return {
-        "status": "ok",
-        "detail": "Configured URLs look valid.",
-    }
 

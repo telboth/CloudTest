@@ -41,9 +41,12 @@ def render_reporter_page(user: dict[str, str], **deps: Any) -> None:
     _request_delete_confirmation = deps["_request_delete_confirmation"]
     _render_delete_confirmation = deps["_render_delete_confirmation"]
     _delete_bug = deps["_delete_bug"]
+    _can_user_delete_bug = deps["_can_user_delete_bug"]
+    _can_user_reopen_bug = deps["_can_user_reopen_bug"]
     CATEGORY_OPTIONS = deps["CATEGORY_OPTIONS"]
     SEVERITY_OPTIONS = deps["SEVERITY_OPTIONS"]
     STATUS_OPTIONS = deps["STATUS_OPTIONS"]
+    REPORTER_SATISFACTION_OPTIONS = deps["REPORTER_SATISFACTION_OPTIONS"]
     MAX_ATTACHMENTS_PER_UPLOAD = deps["MAX_ATTACHMENTS_PER_UPLOAD"]
     MAX_ATTACHMENT_BYTES = deps["MAX_ATTACHMENT_BYTES"]
 
@@ -166,7 +169,27 @@ def render_reporter_page(user: dict[str, str], **deps: Any) -> None:
 
     with st.form("create_bug_form"):
         st.text_input("Tittel", key="reporter_create_title")
-        st.text_area("Beskrivelse", key="reporter_create_description", height=130)
+        uploader_key = f"reporter_new_attachments_{int(st.session_state.get('reporter_uploader_nonce', 0))}"
+        st.markdown(
+            f"""
+            <style>
+            .st-key-{uploader_key} [data-testid="stFileUploader"] {{
+                min-height: 182px;
+            }}
+            </style>
+            """,
+            unsafe_allow_html=True,
+        )
+        desc_col, upload_col = st.columns([1.9, 1.1])
+        with desc_col:
+            st.text_area("Beskrivelse", key="reporter_create_description", height=180)
+        with upload_col:
+            new_attachments = st.file_uploader(
+                "Vedlegg",
+                accept_multiple_files=True,
+                key=uploader_key,
+                help=f"Maks {MAX_ATTACHMENTS_PER_UPLOAD} filer, opptil {MAX_ATTACHMENT_BYTES // (1024 * 1024)} MB per fil.",
+            )
 
         if st.session_state.get("reporter_typeahead_error"):
             st.warning(str(st.session_state.get("reporter_typeahead_error")))
@@ -195,11 +218,13 @@ def render_reporter_page(user: dict[str, str], **deps: Any) -> None:
         with action_col_4:
             clear_fields_clicked = st.form_submit_button("Tøm felter", use_container_width=True)
 
-        c1, c2 = st.columns(2)
+        c1, c2, c_notify = st.columns([1, 1, 1.2])
         with c1:
             st.selectbox("Kategori", CATEGORY_OPTIONS, key="reporter_create_category")
         with c2:
             st.selectbox("Alvorlighetsgrad", SEVERITY_OPTIONS, key="reporter_create_severity")
+        with c_notify:
+            st.text_input("Varsle e-post(er)", key="reporter_create_notify_emails")
 
         c3, c4, c5 = st.columns([1.2, 1.2, 1.6])
         with c3:
@@ -218,18 +243,9 @@ def render_reporter_page(user: dict[str, str], **deps: Any) -> None:
         with c5:
             st.text_input("Tagger (kommaseparert)", key="reporter_create_tags")
 
-        if assignable_emails:
-            st.caption(f"Tildelbare brukere ({len(assignable_emails)}): {', '.join(assignable_emails[:8])}")
-        st.text_input("Varsle e-post(er)", key="reporter_create_notify_emails")
-
-        uploader_key = f"reporter_new_attachments_{int(st.session_state.get('reporter_uploader_nonce', 0))}"
-        new_attachments = st.file_uploader(
-            "Vedlegg",
-            accept_multiple_files=True,
-            key=uploader_key,
-            help=f"Maks {MAX_ATTACHMENTS_PER_UPLOAD} filer, opptil {MAX_ATTACHMENT_BYTES // (1024 * 1024)} MB per fil.",
-        )
-        duplicate_col, unique_col = st.columns([1, 2.2])
+        create_col, duplicate_col, unique_col = st.columns([1, 1, 2.2])
+        with create_col:
+            submitted = st.form_submit_button("Opprett bug", use_container_width=True, key="reporter_create_submit")
         with duplicate_col:
             duplicate_check_clicked = st.form_submit_button("Sjekk duplikater", use_container_width=True)
         with unique_col:
@@ -238,7 +254,6 @@ def render_reporter_page(user: dict[str, str], **deps: Any) -> None:
                 key="reporter_confirm_unique_bug",
                 help="Kryss av hvis du har vurdert lignende bugs og fortsatt vil sende inn ny bug.",
             )
-        submitted = st.form_submit_button("Opprett bug", use_container_width=True, key="reporter_create_submit")
 
     if clear_fields_clicked:
         _reset_reporter_form_state()
@@ -325,7 +340,7 @@ def render_reporter_page(user: dict[str, str], **deps: Any) -> None:
 
     bugs = _prepare_page_bug_list(user=user, prefix="reporter")
     render_bug_status_summary(bugs=bugs, title="Reporter-oversikt")
-    visible_count = render_bug_list_controls(prefix="reporter", total_count=len(bugs), default_visible=10)
+    visible_count = render_bug_list_controls(prefix="reporter", total_count=len(bugs), default_visible=5)
     st.caption(f"Viser {min(len(bugs), visible_count)} av {len(bugs)} bugs.")
     visible_bugs = bugs[:visible_count]
     _prefetch_bug_details(visible_bugs)
@@ -358,6 +373,8 @@ def render_reporter_page(user: dict[str, str], **deps: Any) -> None:
             )
             if bug.notify_emails:
                 st.caption(f"Varsling: {bug.notify_emails}")
+            if bug.reporter_satisfaction:
+                st.caption(f"Rapportør-tilfredshet: {bug.reporter_satisfaction}")
             _render_attachments(bug, key_prefix=f"reporter_{bug.id}")
 
             _render_bug_thread(bug, title="Samtale", collapsed=False, dedupe_consecutive=True)
@@ -370,7 +387,7 @@ def render_reporter_page(user: dict[str, str], **deps: Any) -> None:
                 placeholder="Skriv nye endringer, presiseringer eller svar fra rapportør.",
                 disabled=is_resolved,
             )
-            c1, c2 = st.columns(2)
+            c1, c2, c2b = st.columns([1, 1, 1.2])
             with c1:
                 bug_status = st.selectbox(
                     "Status",
@@ -388,6 +405,20 @@ def render_reporter_page(user: dict[str, str], **deps: Any) -> None:
                     SEVERITY_OPTIONS,
                     index=SEVERITY_OPTIONS.index(bug.severity) if bug.severity in SEVERITY_OPTIONS else 1,
                     key=f"reporter_severity_{bug.id}",
+                    disabled=is_resolved,
+                )
+            with c2b:
+                satisfaction_options = ["ikke oppgitt", *REPORTER_SATISFACTION_OPTIONS]
+                current_satisfaction = (
+                    bug.reporter_satisfaction
+                    if bug.reporter_satisfaction in REPORTER_SATISFACTION_OPTIONS
+                    else "ikke oppgitt"
+                )
+                reporter_satisfaction = st.selectbox(
+                    "Rapportør-tilfredshet",
+                    options=satisfaction_options,
+                    index=satisfaction_options.index(current_satisfaction),
+                    key=f"reporter_satisfaction_{bug.id}",
                     disabled=is_resolved,
                 )
 
@@ -443,13 +474,14 @@ def render_reporter_page(user: dict[str, str], **deps: Any) -> None:
                     "Sett tilbake til Åpen",
                     key=f"reporter_reopen_{bug.id}",
                     use_container_width=True,
-                    disabled=not is_resolved,
+                    disabled=(not is_resolved) or (not _can_user_reopen_bug(user)),
                 )
             with action_c3:
                 delete_clicked = st.button(
                     "Slett bug",
                     key=f"reporter_delete_{bug.id}",
                     use_container_width=True,
+                    disabled=not _can_user_delete_bug(user),
                 )
 
             if reopen_clicked:
@@ -481,7 +513,7 @@ def render_reporter_page(user: dict[str, str], **deps: Any) -> None:
                 if delete_error:
                     st.error(delete_error)
                 else:
-                    st.success("Bug slettet.")
+                    st.success("Bug flyttet til papirkurv.")
                     st.rerun()
 
             if save_clicked:
@@ -494,6 +526,7 @@ def render_reporter_page(user: dict[str, str], **deps: Any) -> None:
                     environment=bug_environment,
                     tags=bug_tags,
                     notify_emails=bug_notify,
+                    reporter_satisfaction=None if reporter_satisfaction == "ikke oppgitt" else reporter_satisfaction,
                 )
                 if error:
                     st.error(error)

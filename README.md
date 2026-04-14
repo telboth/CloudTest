@@ -3,9 +3,11 @@
 CloudTest er en backend-los variant av bugsystemet der alt kjorer i en Streamlit-app:
 
 - En app: `unified_app.py`
-- PostgreSQL + pgvector (standardprofil i CloudTest)
+- SQLite (standard lokalt) eller PostgreSQL + pgvector
 - Vedlegg/lagring via backend-abstraksjon (`ATTACHMENT_STORAGE_BACKEND`, default `filesystem`)
 - Microsoft Entra via Streamlit OIDC (`st.login`)
+- Soft-delete (papirkurv) med gjenoppretting i Admin
+- Rolle-/policystyring for sletting og gjenåpning i Admin
 
 ## Dependencies
 
@@ -27,7 +29,9 @@ pip install -r .\CloudTest\requirements-optional-local-ai.txt
 powershell -ExecutionPolicy Bypass -File .\CloudTest\start_cloud_test.ps1
 ```
 
-Starter med PostgreSQL som standard (`DATABASE_URL`), og skriver valgt DB-url ved oppstart.
+Starter med `DATABASE_URL` fra miljoet hvis satt, ellers lokal SQLite som standard, og skriver valgt DB-url ved oppstart.
+Skriptet kjører også `Alembic upgrade head` automatisk før appstart.
+Som standard kjøres nå også schema-verifisering, og migrering-fallback er deaktivert (cutover-modus).
 
 Kortkommando:
 
@@ -35,14 +39,63 @@ Kortkommando:
 powershell -ExecutionPolicy Bypass -File .\CloudTest\start_apps.ps1
 ```
 
-Valgfri SQLite fallback (kun for lokal test, ikke cloud):
+Valgfri eksplisitt SQLite-profil:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\CloudTest\start_cloud_test.ps1 -UseSqliteFallback
 ```
 
-Dette setter `CLOUD_TEST_ALLOW_SQLITE_FALLBACK=true` for prosessen, slik at appen kan starte uten PostgreSQL lokalt.
-Hvis du starter med `streamlit run` direkte lokalt, tillates SQLite fallback automatisk.
+Dette setter `CLOUD_TEST_ALLOW_SQLITE_FALLBACK=true` for prosessen.
+
+Valgfri dirty reindex ved oppstart:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\CloudTest\start_cloud_test.ps1 -ReindexDirtyOnStart
+```
+
+Hvis du kun vil starte appen uten migrering (f.eks. ren UI-testing):
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\CloudTest\start_cloud_test.ps1 -SkipMigrations
+```
+
+Hvis du vil hoppe over schema-verifisering:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\CloudTest\start_cloud_test.ps1 -SkipSchemaVerify
+```
+
+Hvis du vil tillate legacy fallback midlertidig:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\CloudTest\start_cloud_test.ps1 -AllowMigrationFallback -EnableLegacySchemaBootstrap
+```
+
+## DB-vedlikehold (fase 4/5)
+
+Kjør migrering manuelt:
+
+```powershell
+python .\CloudTest\scripts\db_maintenance.py --migrate
+```
+
+Verifiser schema + migreringsstatus:
+
+```powershell
+python .\CloudTest\scripts\db_verify.py --strict
+```
+
+Kjør dirty reindex manuelt:
+
+```powershell
+python .\CloudTest\scripts\db_maintenance.py --reindex --dirty-only
+```
+
+Tekst-only reindex (uten nye embeddings):
+
+```powershell
+python .\CloudTest\scripts\db_maintenance.py --reindex --dirty-only --without-embeddings
+```
 
 ## Stopp
 
@@ -68,6 +121,12 @@ Dette sjekker blant annet:
 - E-post normalisering/validering
 - Duplikatdeteksjon
 - Admin-filter parsing
+
+## Admin drift
+
+- **Backup/restore (SQLite)**: Opprett og last ned `.zip` med database + vedlegg, og restore ved behov.
+- **Papirkurv**: Sletting flytter bugs til papirkurv. Admin kan gjenopprette eller slette permanent.
+- **Ytelse**: Side-render, søkelatens og AI-ventetid vises i driftspanel/sidebar.
 
 ## UI-regresjon (manuell)
 
@@ -104,8 +163,8 @@ Eksempel:
 
 `ATTACHMENT_STORAGE_BACKEND` kan settes, men `filesystem` er standard og brukes av CloudTest i dag.
 
-I CloudTest-modus kreves PostgreSQL som standard. For lokal dev kan du eksplisitt tillate SQLite med `CLOUD_TEST_ALLOW_SQLITE_FALLBACK=true` (settes automatisk av `-UseSqliteFallback`).
-Hvis PostgreSQL mangler `vector`-extension eller brukeren ikke har rettighet til `CREATE EXTENSION`, starter appen likevel med tekst-basert fallback for embeddings.
+CloudTest støtter både SQLite og PostgreSQL. For PostgreSQL brukes pgvector når extension er tilgjengelig.
+Hvis PostgreSQL mangler `vector`-extension eller brukeren ikke har rettighet til `CREATE EXTENSION`, starter appen med tekst-basert fallback for embeddings.
 
 ## Sikkerhetsnotater
 

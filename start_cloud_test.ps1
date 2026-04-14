@@ -1,7 +1,13 @@
 param(
     [string]$PythonExe = "python",
     [string]$DatabaseUrl = "",
-    [switch]$UseSqliteFallback
+    [switch]$UseSqliteFallback,
+    [switch]$SkipMigrations,
+    [switch]$ReindexDirtyOnStart,
+    [switch]$ReindexWithoutEmbeddings,
+    [switch]$SkipSchemaVerify,
+    [switch]$AllowMigrationFallback,
+    [switch]$EnableLegacySchemaBootstrap
 )
 
 $ErrorActionPreference = "Stop"
@@ -30,6 +36,8 @@ Get-ChildItem -Path $authPendingDir -Filter *.json -ErrorAction SilentlyContinue
 [System.Environment]::SetEnvironmentVariable("EMBEDDING_PROVIDER", "openai", "Process")
 [System.Environment]::SetEnvironmentVariable("STORAGE_DIR", $cloudStorageDir, "Process")
 [System.Environment]::SetEnvironmentVariable("ATTACHMENT_STORAGE_BACKEND", "filesystem", "Process")
+[System.Environment]::SetEnvironmentVariable("CLOUDTEST_ALLOW_MIGRATION_FALLBACK", ($(if ($AllowMigrationFallback) { "true" } else { "false" })), "Process")
+[System.Environment]::SetEnvironmentVariable("CLOUDTEST_ENABLE_LEGACY_SCHEMA_BOOTSTRAP", ($(if ($EnableLegacySchemaBootstrap) { "true" } else { "false" })), "Process")
 
 $resolvedDatabaseUrl = ""
 if ($UseSqliteFallback) {
@@ -45,22 +53,50 @@ if ($UseSqliteFallback) {
     [System.Environment]::SetEnvironmentVariable("CLOUD_TEST_ALLOW_SQLITE_FALLBACK", "false", "Process")
     $resolvedDatabaseUrl = $env:DATABASE_URL.Trim()
 } else {
-    [System.Environment]::SetEnvironmentVariable("CLOUD_TEST_ALLOW_SQLITE_FALLBACK", "false", "Process")
-    $resolvedDatabaseUrl = "postgresql+psycopg://bugapp:bugapp@localhost:5432/bug_ticket_system"
+    [System.Environment]::SetEnvironmentVariable("CLOUD_TEST_ALLOW_SQLITE_FALLBACK", "true", "Process")
+    $resolvedDatabaseUrl = "sqlite:///$($cloudDbPath.Replace('\','/'))"
 }
 [System.Environment]::SetEnvironmentVariable("DATABASE_URL", $resolvedDatabaseUrl, "Process")
 Write-Host "CloudTest DATABASE_URL: $resolvedDatabaseUrl"
 if ($resolvedDatabaseUrl -like "postgresql*") {
-    Write-Host "PostgreSQL-modus aktivert (anbefalt for cloud/samtidige brukere)."
+    Write-Host "PostgreSQL-modus aktivert."
 } elseif ($resolvedDatabaseUrl -like "sqlite*") {
-    Write-Warning "SQLite fallback aktivert. For cloud-ready drift anbefales PostgreSQL."
+    Write-Host "SQLite-modus aktivert."
+}
+
+$maintenanceScript = Join-Path $cloudRoot "scripts\db_maintenance.py"
+if (-not $SkipMigrations) {
+    Write-Host "Kjører DB-migreringer (Alembic)..."
+    & $PythonExe $maintenanceScript --migrate
+    if ($LASTEXITCODE -ne 0) {
+        throw "DB-migrering feilet (exit code $LASTEXITCODE)."
+    }
+}
+if ($ReindexDirtyOnStart) {
+    Write-Host "Kjører dirty reindex av søkeindeks..."
+    if ($ReindexWithoutEmbeddings) {
+        & $PythonExe $maintenanceScript --reindex --dirty-only --without-embeddings
+    }
+    else {
+        & $PythonExe $maintenanceScript --reindex --dirty-only
+    }
+    if ($LASTEXITCODE -ne 0) {
+        throw "Dirty reindex feilet (exit code $LASTEXITCODE)."
+    }
+}
+if (-not $SkipSchemaVerify) {
+    Write-Host "Verifiserer DB-schema..."
+    & $PythonExe (Join-Path $cloudRoot "scripts\db_verify.py") --strict
+    if ($LASTEXITCODE -ne 0) {
+        throw "DB-verifisering feilet (exit code $LASTEXITCODE)."
+    }
 }
 
 $apps = @(
     @{ Name = "unified"; Port = 8601; Entry = "unified_app.py" }
 )
 
-foreach ($port in @(8010, 8601, 8602, 8603)) {
+foreach ($port in @(8601, 8602, 8603)) {
     $connections = @(Get-NetTCPConnection -LocalPort $port -ErrorAction SilentlyContinue | Select-Object -ExpandProperty OwningProcess -Unique)
     foreach ($procId in $connections) {
         if ($procId) {

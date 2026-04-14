@@ -8,9 +8,7 @@ ROOT_DIR = Path(__file__).resolve().parents[2]
 class Settings(BaseSettings):
     app_name: str = "Bug Ticket System"
     secret_key: str = "change-me-for-real-use"
-    access_token_expire_minutes: int = 720
-    database_url: str = "postgresql+psycopg://bugapp:bugapp@localhost:5432/bug_ticket_system"
-    api_base_url: str = "http://localhost:8010"
+    database_url: str = f"sqlite:///{(ROOT_DIR / 'bug_tracker_cloud.db').as_posix()}"
     storage_dir: str = "storage"
     default_admin_email: str = "admin@example.com"
     default_admin_password: str = "admin123"
@@ -20,24 +18,17 @@ class Settings(BaseSettings):
     embedding_model: str = "text-embedding-3-small"
     local_embedding_model: str = "sentence-transformers/all-MiniLM-L6-v2"
     embedding_lock_enabled: bool = True
+    sqlite_vec_enabled: bool = True
+    sqlite_vec_dimensions: int = 1536
+    sqlite_vec_embedding_provider: str = "openai"
+    sqlite_vec_embedding_model: str = "text-embedding-3-small"
+    sqlite_vec_table_name: str = "bug_search_vec"
+    sqlite_fts_table_name: str = "bug_search_fts"
     ollama_base_url: str = "http://127.0.0.1:11434"
     ollama_model: str = "qwen2.5:7b"
     openai_api_key: str | None = None
     openai_model: str = "gpt-4o-mini"
     openai_embedding_model: str = "text-embedding-3-small"
-    entra_tenant_id: str | None = None
-    entra_client_id: str | None = None
-    entra_client_secret: str | None = None
-    entra_redirect_uri: str = "http://localhost:8010/auth/entra/callback"
-    streamlit_reporter_url: str = "http://localhost:8501"
-    streamlit_assignee_url: str = "http://localhost:8502"
-    streamlit_admin_url: str = "http://localhost:8503"
-    entra_admin_emails: str = ""
-    entra_assignee_emails: str = ""
-    azure_devops_org: str = ""
-    azure_devops_project: str = ""
-    azure_devops_pat: str | None = None
-    azure_devops_dashboard_url: str = "https://dev.azure.com/xlentoslo/XlentRAG/_workitems/recentlyupdated/"
 
     model_config = SettingsConfigDict(env_file=ROOT_DIR / ".env", env_file_encoding="utf-8")
 
@@ -67,32 +58,8 @@ class Settings(BaseSettings):
         return self.database_backend == "postgresql"
 
     @property
-    def entra_enabled(self) -> bool:
-        return bool(self.entra_tenant_id and self.entra_client_id and self.entra_client_secret)
-
-    @property
-    def entra_admin_email_list(self) -> set[str]:
-        return {
-            value.strip().casefold()
-            for value in self.entra_admin_emails.split(",")
-            if value.strip()
-        }
-
-    @property
-    def entra_assignee_email_list(self) -> set[str]:
-        return {
-            value.strip().casefold()
-            for value in self.entra_assignee_emails.split(",")
-            if value.strip()
-        }
-
-    def streamlit_url_for_app(self, app_name: str) -> str:
-        mapping = {
-            "reporter": self.streamlit_reporter_url,
-            "assignee": self.streamlit_assignee_url,
-            "admin": self.streamlit_admin_url,
-        }
-        return mapping.get(app_name, self.streamlit_reporter_url)
+    def sqlite_vec_lock_active(self) -> bool:
+        return self.database_is_sqlite and bool(self.sqlite_vec_enabled)
 
 
 settings = Settings()

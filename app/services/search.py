@@ -2,6 +2,7 @@ import hashlib
 import math
 import re
 from collections.abc import Iterable
+from datetime import datetime, timezone
 from threading import Lock
 from time import perf_counter
 
@@ -42,6 +43,48 @@ _SEARCH_TELEMETRY: dict[str, float] = {
 _PGVECTOR_NATIVE_SEARCH_DISABLED = False
 
 
+def _sqlite_vec_lock_active() -> bool:
+    explicit = getattr(settings, "sqlite_vec_lock_active", None)
+    if explicit is not None:
+        return bool(explicit)
+    return bool(getattr(settings, "database_is_sqlite", False) and getattr(settings, "sqlite_vec_enabled", False))
+
+
+def _sqlite_vec_embedding_provider() -> str:
+    provider = str(getattr(settings, "sqlite_vec_embedding_provider", "openai") or "openai").strip().casefold()
+    if provider not in {"openai", "local"}:
+        provider = "openai"
+    return provider
+
+
+def _sqlite_vec_embedding_model(provider: str) -> str:
+    provider = provider if provider in {"openai", "local"} else "openai"
+    default_model = settings.local_embedding_model if provider == "local" else settings.embedding_model
+    configured = str(getattr(settings, "sqlite_vec_embedding_model", default_model) or default_model).strip()
+    return configured or default_model
+
+
+def _tokenize_query(query: str) -> list[str]:
+    tokens = [token for token in re.split(r"\W+", (query or "").casefold()) if token]
+    # Keep token order but remove duplicates to avoid overweighting repeated words.
+    return list(dict.fromkeys(tokens))
+
+
+def _hybrid_weights_for_query(query: str) -> tuple[float, float, float, float]:
+    tokens = _tokenize_query(query)
+    if len(tokens) <= 2:
+        # Short queries are typically better handled by lexical precision.
+        return (0.75, 0.25, 0.18, 0.55)  # lexical_w, semantic_w, lexical_gate, semantic_gate
+    return (0.45, 0.55, 0.12, 0.42)
+
+
+def _similarity_weights_for_query(query: str) -> tuple[float, float, float, float]:
+    tokens = _tokenize_query(query)
+    if len(tokens) <= 2:
+        return (0.35, 0.65, 0.10, 0.30)
+    return (0.20, 0.80, 0.08, 0.26)
+
+
 def search_visible_bugs(
     db: Session,
     *,
@@ -66,7 +109,11 @@ def search_visible_bugs(
         )
         .order_by(Bug.created_at.desc())
     ).all()
-    visible_bugs = [bug for bug in bugs if can_view_bug(current_user, bug)]
+    visible_bugs = [
+        bug
+        for bug in bugs
+        if can_view_bug(current_user, bug) and getattr(bug, "deleted_at", None) is None
+    ]
     if not visible_bugs:
         _record_search_telemetry(mode="keyword_fallback", results_count=0, duration_ms=(perf_counter() - started) * 1000, embedding_available=False)
         return []
@@ -103,13 +150,18 @@ def search_visible_bugs(
         embedding_model=resolved_model,
     )
 
+    lexical_weight, semantic_weight, lexical_gate, semantic_gate = _hybrid_weights_for_query(cleaned_query)
+    if not query_embedding or not semantic_scores:
+        lexical_weight, semantic_weight = 1.0, 0.0
+        semantic_gate = 1.1
+
     ranked: list[tuple[float, Bug]] = []
     for bug in visible_bugs:
         search_text = _build_bug_search_text(bug)
         keyword_score = _keyword_score(cleaned_query, bug, search_text)
         semantic_score = semantic_scores.get(bug.id, 0.0)
-        final_score = (semantic_score * 0.7) + (keyword_score * 0.3)
-        if keyword_score <= 0 and semantic_score < 0.45:
+        final_score = (semantic_score * semantic_weight) + (keyword_score * lexical_weight)
+        if keyword_score < lexical_gate and semantic_score < semantic_gate:
             continue
         ranked.append((final_score, bug))
 
@@ -160,7 +212,11 @@ def retrieve_similar_visible_bugs(
         )
         .order_by(Bug.created_at.desc())
     ).all()
-    visible_bugs = [bug for bug in bugs if can_view_bug(current_user, bug)]
+    visible_bugs = [
+        bug
+        for bug in bugs
+        if can_view_bug(current_user, bug) and getattr(bug, "deleted_at", None) is None
+    ]
     if not visible_bugs:
         return []
 
@@ -181,13 +237,18 @@ def retrieve_similar_visible_bugs(
         embedding_model=resolved_model,
     )
 
+    lexical_weight, semantic_weight, lexical_gate, semantic_gate = _similarity_weights_for_query(cleaned_query)
+    if not query_embedding or not semantic_scores:
+        lexical_weight, semantic_weight = 1.0, 0.0
+        semantic_gate = 1.1
+
     ranked: list[tuple[float, Bug]] = []
     for bug in visible_bugs:
         search_text = _build_bug_search_text(bug)
         keyword_score = _keyword_score(cleaned_query, bug, search_text)
         semantic_score = semantic_scores.get(bug.id, 0.0)
-        final_score = (semantic_score * 0.8) + (keyword_score * 0.2)
-        if keyword_score <= 0 and semantic_score < 0.3:
+        final_score = (semantic_score * semantic_weight) + (keyword_score * lexical_weight)
+        if keyword_score < lexical_gate and semantic_score < semantic_gate:
             continue
         ranked.append((final_score, bug))
 
@@ -317,25 +378,25 @@ def _ensure_search_index(
         embedding_model=current_model,
     )
     row = db.get(BugSearchIndex, bug.id)
-    if (
-        row
-        and row.content_hash == content_hash
-        and row.embedding_provider == current_provider
-        and row.embedding_model == current_model
-        and (not build_embedding or bool(row.embedding))
-    ):
-        return row
+    if row and row.content_hash == content_hash and row.embedding_provider == current_provider and row.embedding_model == current_model:
+        if build_embedding and bool(row.embedding) and int(getattr(row, "needs_reindex", 0) or 0) == 0:
+            return row
+        if not build_embedding and int(getattr(row, "needs_reindex", 0) or 0) == 1:
+            return row
 
-    embedding = (
-        _build_embedding(
+    embedding: list[float] | None = None
+    embedding_dimensions: int | None = None
+    needs_reindex = 1
+    indexed_at: datetime | None = None
+    if build_embedding:
+        embedding = _build_embedding(
             search_text,
             embedding_provider=current_provider,
             embedding_model=current_model,
         )
-        if build_embedding
-        else None
-    )
-    embedding_dimensions = len(embedding) if embedding else None
+        embedding_dimensions = len(embedding) if embedding else None
+        needs_reindex = 0
+        indexed_at = datetime.now(timezone.utc)
     if row is None:
         row = BugSearchIndex(
             bug_id=bug.id,
@@ -344,6 +405,9 @@ def _ensure_search_index(
             embedding_model=current_model,
             embedding_dimensions=embedding_dimensions,
             search_text=search_text,
+            needs_reindex=needs_reindex,
+            last_error=None,
+            indexed_at=indexed_at,
             embedding=embedding,
         )
         db.add(row)
@@ -353,6 +417,9 @@ def _ensure_search_index(
         row.embedding_model = current_model
         row.embedding_dimensions = embedding_dimensions
         row.search_text = search_text
+        row.needs_reindex = needs_reindex
+        row.last_error = None
+        row.indexed_at = indexed_at
         row.embedding = embedding
     db.flush()
     return row
@@ -450,10 +517,14 @@ def _resolve_embedding_selection(
     embedding_provider: str | None = None,
     embedding_model: str | None = None,
 ) -> tuple[str, str]:
-    configured_provider = (settings.embedding_provider or "openai").strip().casefold()
-    configured_model = (
-        settings.local_embedding_model if configured_provider == "local" else settings.embedding_model
-    )
+    if _sqlite_vec_lock_active():
+        configured_provider = _sqlite_vec_embedding_provider()
+        configured_model = _sqlite_vec_embedding_model(configured_provider)
+    else:
+        configured_provider = (settings.embedding_provider or "openai").strip().casefold()
+        configured_model = (
+            settings.local_embedding_model if configured_provider == "local" else settings.embedding_model
+        )
 
     if settings.embedding_lock_enabled:
         return configured_provider, configured_model
@@ -503,7 +574,7 @@ def upsert_bug_search_index_by_id(
             selectinload(Bug.history),
             selectinload(Bug.view_states),
         )
-        .where(Bug.id == bug_id)
+        .where(Bug.id == bug_id, Bug.deleted_at.is_(None))
     )
     if not bug:
         return None
@@ -516,12 +587,29 @@ def upsert_bug_search_index_by_id(
     )
 
 
+def mark_bug_search_index_dirty_by_id(
+    db: Session,
+    *,
+    bug_id: int,
+    embedding_provider: str | None = None,
+    embedding_model: str | None = None,
+) -> BugSearchIndex | None:
+    return upsert_bug_search_index_by_id(
+        db,
+        bug_id=bug_id,
+        embedding_provider=embedding_provider,
+        embedding_model=embedding_model,
+        build_embedding=False,
+    )
+
+
 def rebuild_bug_search_index(
     db: Session,
     *,
     embedding_provider: str | None = None,
     embedding_model: str | None = None,
     build_embedding: bool = True,
+    dirty_only: bool = False,
     limit: int | None = None,
 ) -> int:
     query = (
@@ -532,8 +620,16 @@ def rebuild_bug_search_index(
             selectinload(Bug.history),
             selectinload(Bug.view_states),
         )
+        .where(Bug.deleted_at.is_(None))
         .order_by(Bug.id.asc())
     )
+    if dirty_only:
+        query = query.outerjoin(BugSearchIndex, BugSearchIndex.bug_id == Bug.id).where(
+            (BugSearchIndex.bug_id.is_(None))
+            | (BugSearchIndex.needs_reindex == 1)
+            | (BugSearchIndex.updated_at.is_(None))
+            | (BugSearchIndex.updated_at < Bug.updated_at)
+        )
     if limit is not None and limit > 0:
         query = query.limit(limit)
     bugs = db.scalars(query).all()
@@ -588,6 +684,8 @@ def _search_index_row_is_stale(
 ) -> bool:
     if row is None:
         return True
+    if int(getattr(row, "needs_reindex", 0) or 0) == 1:
+        return True
     if row.embedding_provider != embedding_provider or row.embedding_model != embedding_model:
         return True
     expected_hash = _search_text_content_hash(
@@ -610,23 +708,30 @@ def _keyword_score(query: str, bug: Bug, search_text: str) -> float:
     lower_query = query.casefold()
     lower_text = search_text.casefold()
     lower_title = bug.title.casefold()
-    query_tokens = [token for token in re.split(r"\W+", lower_query) if token]
+    query_tokens = _tokenize_query(lower_query)
 
-    score = 0.0
-    if lower_query in lower_title:
-        score += 1.0
-    if lower_query in lower_text:
-        score += 0.7
     if lower_query == str(bug.id):
-        score += 1.5
-    for token in query_tokens:
-        if token == str(bug.id):
-            score += 1.0
-        elif token in lower_title:
-            score += 0.4
-        elif token in lower_text:
-            score += 0.2
-    return min(score, 3.0) / 3.0
+        return 1.0
+
+    if not query_tokens:
+        return 0.0
+
+    title_hits = sum(1 for token in query_tokens if token in lower_title)
+    text_hits = sum(1 for token in query_tokens if token in lower_text)
+    token_count = float(len(query_tokens))
+    title_coverage = title_hits / token_count
+    text_coverage = text_hits / token_count
+
+    phrase_title = 1.0 if lower_query and lower_query in lower_title else 0.0
+    phrase_text = 1.0 if lower_query and lower_query in lower_text else 0.0
+
+    score = (
+        (0.55 * title_coverage)
+        + (0.30 * text_coverage)
+        + (0.12 * phrase_title)
+        + (0.08 * phrase_text)
+    )
+    return max(0.0, min(1.0, score))
 
 
 def _cosine_similarity(left: Iterable[float], right: Iterable[float]) -> float:

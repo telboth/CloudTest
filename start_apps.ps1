@@ -1,7 +1,13 @@
 param(
     [string]$PythonExe = "python",
     [string]$DatabaseUrl = "",
-    [switch]$UseSqliteFallback
+    [switch]$UseSqliteFallback,
+    [switch]$SkipMigrations,
+    [switch]$ReindexDirtyOnStart,
+    [switch]$ReindexWithoutEmbeddings,
+    [switch]$SkipSchemaVerify,
+    [switch]$AllowMigrationFallback,
+    [switch]$EnableLegacySchemaBootstrap
 )
 
 $ErrorActionPreference = "Stop"
@@ -13,9 +19,26 @@ if (-not (Test-Path $startScript)) {
 }
 
 if ($DatabaseUrl -and $DatabaseUrl.Trim()) {
-    & $startScript -PythonExe $PythonExe -DatabaseUrl $DatabaseUrl.Trim() -UseSqliteFallback:$UseSqliteFallback
+    & $startScript `
+        -PythonExe $PythonExe `
+        -DatabaseUrl $DatabaseUrl.Trim() `
+        -UseSqliteFallback:$UseSqliteFallback `
+        -SkipMigrations:$SkipMigrations `
+        -ReindexDirtyOnStart:$ReindexDirtyOnStart `
+        -ReindexWithoutEmbeddings:$ReindexWithoutEmbeddings `
+        -SkipSchemaVerify:$SkipSchemaVerify `
+        -AllowMigrationFallback:$AllowMigrationFallback `
+        -EnableLegacySchemaBootstrap:$EnableLegacySchemaBootstrap
 }
 else {
-    & $startScript -PythonExe $PythonExe -UseSqliteFallback:$UseSqliteFallback
+    & $startScript `
+        -PythonExe $PythonExe `
+        -UseSqliteFallback:$UseSqliteFallback `
+        -SkipMigrations:$SkipMigrations `
+        -ReindexDirtyOnStart:$ReindexDirtyOnStart `
+        -ReindexWithoutEmbeddings:$ReindexWithoutEmbeddings `
+        -SkipSchemaVerify:$SkipSchemaVerify `
+        -AllowMigrationFallback:$AllowMigrationFallback `
+        -EnableLegacySchemaBootstrap:$EnableLegacySchemaBootstrap
 }
 

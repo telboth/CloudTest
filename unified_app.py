@@ -5,26 +5,39 @@ import sys
 import json
 import time
 import re
+import shutil
+import sqlite3
+import tempfile
+import zipfile
 from io import BytesIO
 from difflib import SequenceMatcher
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from collections.abc import Mapping
+from statistics import mean
 from typing import Any, Callable
 from urllib.parse import urlparse
 from uuid import uuid4
 
 CLOUD_ROOT = Path(__file__).resolve().parent
 PROJECT_ROOT = CLOUD_ROOT.parent
-for candidate in (CLOUD_ROOT, PROJECT_ROOT):
-    candidate_str = str(candidate)
-    if candidate_str not in sys.path:
-        sys.path.insert(0, candidate_str)
+
+
+def _prioritize_cloudtest_on_sys_path() -> None:
+    ordered = [str(PROJECT_ROOT), str(CLOUD_ROOT)]
+    for item in ordered:
+        while item in sys.path:
+            sys.path.remove(item)
+    for item in ordered:
+        sys.path.insert(0, item)
+
+
+_prioritize_cloudtest_on_sys_path()
 
 import streamlit as st
 from sqlalchemy import func, select, text
-from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.exc import OperationalError, SQLAlchemyError
 from sqlalchemy.orm.exc import DetachedInstanceError
 from streamlit.web.server.authlib_tornado_integration import TornadoIntegration
 from ai_client import (
@@ -128,10 +141,18 @@ from app.core.database import Base, SessionLocal, engine
 from app.core.logging import get_logger
 from app.core.security import get_password_hash, verify_password
 from app.models.background_job import BackgroundJob
-from app.models.bug import Attachment, Bug, BugComment, BugHistory, BugSearchIndex
+from app.models.bug import AppRuntimeMeta, Attachment, Bug, BugComment, BugHistory, BugSearchIndex
 from app.models.user import User
 from app.services.health import get_ready_health
-from app.services.search import rebuild_bug_search_index, retrieve_similar_visible_bugs, search_visible_bugs
+from app.services.search import (
+    get_search_telemetry_snapshot,
+    mark_bug_search_index_dirty_by_id,
+    rebuild_bug_search_index,
+    retrieve_similar_visible_bugs,
+    search_visible_bugs,
+)
+from app.services.migrations import run_cloudtest_migrations
+from app.services.schema_bootstrap import run_local_schema_upgrades
 from runtime_ui import (
     CATEGORY_OPTIONS,
     MAX_AI_EXTRACTED_TEXT_CHARS,
@@ -383,12 +404,16 @@ def _clear_tracked_job(prefix: str, bug_id: int, job_key: str) -> None:
 
 
 def _wait_for_background_job_completion(job_id: int, *, timeout_seconds: float = 20.0, poll_seconds: float = 0.5) -> str:
-    return _job_runtime.wait_for_background_job_completion(
+    started = time.perf_counter()
+    status = _job_runtime.wait_for_background_job_completion(
         job_id=int(job_id),
         get_background_job_fn=_get_background_job,
         timeout_seconds=timeout_seconds,
         poll_seconds=poll_seconds,
     )
+    elapsed_ms = (time.perf_counter() - started) * 1000.0
+    _record_runtime_metric("ai_wait_ms", elapsed_ms)
+    return status
 
 
 def _background_jobs_snapshot() -> list[dict[str, Any]]:
@@ -416,13 +441,13 @@ def _cloud_test_mode_enabled() -> bool:
     return value in {"1", "true", "yes", "on"}
 
 
-def _cloud_sqlite_fallback_enabled() -> bool:
-    value = str(os.getenv("CLOUD_TEST_ALLOW_SQLITE_FALLBACK", "")).strip().casefold()
+def _legacy_schema_bootstrap_enabled() -> bool:
+    value = str(os.getenv("CLOUDTEST_ENABLE_LEGACY_SCHEMA_BOOTSTRAP", "")).strip().casefold()
     return value in {"1", "true", "yes", "on"}
 
 
-def _running_on_streamlit_cloud() -> bool:
-    value = str(os.getenv("STREAMLIT_CLOUD", "")).strip().casefold()
+def _allow_migration_failure_fallback() -> bool:
+    value = str(os.getenv("CLOUDTEST_ALLOW_MIGRATION_FALLBACK", "true")).strip().casefold()
     return value in {"1", "true", "yes", "on"}
 
 
@@ -435,18 +460,11 @@ def _is_external_postgres_url(url: str) -> bool:
 def _validate_cloud_database_profile() -> None:
     if not _cloud_test_mode_enabled():
         return
+    if settings.database_is_sqlite:
+        logger.info("CloudTest kjører med SQLite-backend.")
+        return
     if not settings.database_is_postgresql:
-        if settings.database_is_sqlite:
-            if _cloud_sqlite_fallback_enabled():
-                logger.warning("CloudTest is running with SQLite fallback (explicitly enabled).")
-                return
-            if not _running_on_streamlit_cloud():
-                logger.warning("CloudTest is running with SQLite fallback (auto-enabled for local run).")
-                return
-        raise RuntimeError(
-            "CloudTest krever PostgreSQL i cloud. Lokalt kan du bruke SQLite fallback med "
-            "'start_cloud_test.ps1 -UseSqliteFallback' eller sette CLOUD_TEST_ALLOW_SQLITE_FALLBACK=true."
-        )
+        raise RuntimeError("Ugyldig DATABASE_URL for CloudTest. Bruk sqlite:///... eller postgresql+psycopg://...")
 
     database_url = str(settings.database_url or "").strip()
     if _is_external_postgres_url(database_url) and "sslmode=" not in database_url.casefold():
@@ -502,7 +520,8 @@ def _vector_extension_status() -> str:
 
 def _admin_index_snapshot() -> dict[str, Any]:
     with db_session() as db:
-        total_bugs = int(db.scalar(select(func.count(Bug.id))) or 0)
+        total_bugs = int(db.scalar(select(func.count(Bug.id)).where(Bug.deleted_at.is_(None))) or 0)
+        deleted_bugs = int(db.scalar(select(func.count(Bug.id)).where(Bug.deleted_at.is_not(None))) or 0)
         indexed_rows = int(db.scalar(select(func.count(BugSearchIndex.bug_id))) or 0)
         embedded_rows = int(
             db.scalar(
@@ -515,14 +534,30 @@ def _admin_index_snapshot() -> dict[str, Any]:
                 select(func.count(Bug.id))
                 .outerjoin(BugSearchIndex, BugSearchIndex.bug_id == Bug.id)
                 .where(
+                    Bug.deleted_at.is_(None),
                     (BugSearchIndex.bug_id.is_(None))
+                    | (BugSearchIndex.needs_reindex == 1)
                     | (BugSearchIndex.updated_at.is_(None))
                     | (BugSearchIndex.updated_at < Bug.updated_at)
                 )
             )
             or 0
         )
-        last_reindexed_at = db.scalar(select(func.max(BugSearchIndex.updated_at)))
+        last_reindexed_at = db.scalar(select(func.max(BugSearchIndex.indexed_at)))
+        try:
+            alembic_revision = str(db.execute(text("SELECT version_num FROM alembic_version LIMIT 1")).scalar() or "")
+        except Exception:
+            alembic_revision = ""
+        try:
+            reindex_meta_rows = db.execute(
+                text(
+                    "SELECT key, value FROM app_runtime_meta "
+                    "WHERE key IN ('search.last_reindex_at', 'search.last_reindex_count')"
+                )
+            ).all()
+            reindex_meta = {str(key): str(value) for key, value in reindex_meta_rows}
+        except Exception:
+            reindex_meta = {}
 
     jobs = _background_jobs_snapshot()
     recent_jobs = jobs[:10]
@@ -541,10 +576,14 @@ def _admin_index_snapshot() -> dict[str, Any]:
         "storage_backend": str(getattr(_ATTACHMENT_STORAGE, "backend_name", "unknown")),
         "vector_extension": _vector_extension_status(),
         "total_bugs": total_bugs,
+        "deleted_bugs": deleted_bugs,
         "indexed_rows": indexed_rows,
         "embedded_rows": embedded_rows,
         "missing_or_stale_rows": missing_or_stale_rows,
         "last_reindexed_at": last_reindexed_at,
+        "alembic_revision": alembic_revision,
+        "last_reindex_meta_at": reindex_meta.get("search.last_reindex_at"),
+        "last_reindex_meta_count": reindex_meta.get("search.last_reindex_count"),
         "recent_jobs": recent_jobs,
         "recent_errors": recent_errors,
         "running_count": running_count,
@@ -561,10 +600,12 @@ def _run_rebuild_index_job(*, embedding_provider: str, embedding_model: str) -> 
                 embedding_provider=embedding_provider,
                 embedding_model=embedding_model,
                 build_embedding=True,
+                dirty_only=True,
             )
-            db.commit()
+            _commit_with_retry(db, operation="Rebuild index")
         return {
             "processed": int(processed),
+            "mode": "dirty_only",
             "embedding_provider": embedding_provider,
             "embedding_model": embedding_model,
         }
@@ -617,7 +658,7 @@ def _render_admin_operations_panel(user: dict[str, str]) -> None:
             "Rebuild index",
             key="admin_rebuild_index",
             use_container_width=True,
-            help="Rebygger søkeindeks for alle bugs i bakgrunnen.",
+            help="Rebygger søkeindeks for manglende/utdaterte bugs i bakgrunnen.",
         )
         refresh_health_clicked = c2.button(
             "Health refresh",
@@ -688,10 +729,12 @@ def _render_admin_operations_panel(user: dict[str, str]) -> None:
             )
 
         snapshot = _admin_index_snapshot()
+        perf = _runtime_performance_snapshot()
         st.caption(
             f"Database: {snapshot['database_backend']} ({snapshot['database_url_masked']}) | "
             f"Lagring: {snapshot.get('storage_backend', 'unknown')}"
         )
+        st.caption(f"Alembic revisjon: {snapshot.get('alembic_revision') or '-'}")
         vector_status = str(snapshot.get("vector_extension") or "unknown")
         vector_label = {
             "enabled": "pgvector: aktiv",
@@ -707,14 +750,136 @@ def _render_admin_operations_panel(user: dict[str, str]) -> None:
         m2.metric("Indekserte", int(snapshot.get("indexed_rows") or 0))
         m3.metric("Med embedding", int(snapshot.get("embedded_rows") or 0))
         m4.metric("Mangl./utdatert", int(snapshot.get("missing_or_stale_rows") or 0))
+        st.caption(f"Papirkurv: {int(snapshot.get('deleted_bugs') or 0)}")
         st.caption(
             f"Sist reindeksert: {format_datetime_display(snapshot.get('last_reindexed_at'))}"
         )
+        last_meta_at = str(snapshot.get("last_reindex_meta_at") or "").strip()
+        last_meta_count = str(snapshot.get("last_reindex_meta_count") or "").strip()
+        if last_meta_at or last_meta_count:
+            st.caption(
+                f"Reindex-meta: at={last_meta_at or '-'} | count={last_meta_count or '-'}"
+            )
 
         q1, q2, q3 = st.columns(3)
         q1.metric("Jobber kjører", int(snapshot.get("running_count") or 0))
         q2.metric("Jobber venter", int(snapshot.get("pending_count") or 0))
         q3.metric("Jobber feilet", int(snapshot.get("failed_count") or 0))
+
+        st.caption("Ytelse")
+        p1, p2, p3 = st.columns(3)
+        p1.metric("Søk snitt (ms)", round(float(perf.get("search_avg_ms") or 0.0), 1))
+        p2.metric("AI venting snitt (ms)", round(float(perf.get("ai_wait_avg_ms") or 0.0), 1))
+        p3.metric("Admin visning (ms)", round(float(perf.get("page_admin_ms") or 0.0), 1))
+        st.caption(
+            "Siste side-render (ms): "
+            f"Reporter={round(float(perf.get('page_reporter_ms') or 0.0), 1)} | "
+            f"Assignee={round(float(perf.get('page_assignee_ms') or 0.0), 1)} | "
+            f"Admin={round(float(perf.get('page_admin_ms') or 0.0), 1)}"
+        )
+        st.caption(
+            "Siste søk (ms): "
+            f"Reporter={round(float(perf.get('search_reporter_ms') or 0.0), 1)} | "
+            f"Assignee={round(float(perf.get('search_assignee_ms') or 0.0), 1)} | "
+            f"Admin={round(float(perf.get('search_admin_ms') or 0.0), 1)}"
+        )
+
+        st.divider()
+        st.caption("Backup / restore")
+        b1, b2 = st.columns(2)
+        if b1.button("Lag backup (.zip)", key="admin_backup_build", use_container_width=True):
+            backup_bytes, backup_error = _build_backup_zip_bytes()
+            if backup_error:
+                st.error(backup_error)
+            elif backup_bytes:
+                now_text = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+                st.session_state["admin_backup_bytes"] = backup_bytes
+                st.session_state["admin_backup_name"] = f"cloudtest_backup_{now_text}.zip"
+                st.success("Backup klar for nedlasting.")
+        backup_payload = st.session_state.get("admin_backup_bytes")
+        backup_name = str(st.session_state.get("admin_backup_name") or "cloudtest_backup.zip")
+        if isinstance(backup_payload, (bytes, bytearray)) and backup_payload:
+            b2.download_button(
+                "Last ned backup",
+                data=bytes(backup_payload),
+                file_name=backup_name,
+                mime="application/zip",
+                key="admin_backup_download",
+                use_container_width=True,
+            )
+
+        restore_file = st.file_uploader(
+            "Restore fra backup (.zip)",
+            type=["zip"],
+            key="admin_restore_upload",
+            help="Gjenoppretter database og vedlegg fra valgt backupfil.",
+        )
+        confirm_restore = st.checkbox(
+            "Jeg forstår at restore overskriver dagens data.",
+            key="admin_restore_confirm",
+            value=False,
+        )
+        if st.button("Kjør restore", key="admin_restore_run", use_container_width=True):
+            if not confirm_restore:
+                st.warning("Bekreft restore før du fortsetter.")
+            else:
+                restore_error = _restore_from_backup_zip(restore_file)
+                if restore_error:
+                    st.error(restore_error)
+                else:
+                    st.success("Restore fullført. Oppdaterer visning ...")
+                    _clear_bug_cache()
+                    st.rerun()
+
+        st.divider()
+        st.caption("Papirkurv")
+        can_permanent_delete = _policy_allows(
+            policy_key="policy.hard_delete_roles",
+            user_role=user.get("role", ""),
+            default_roles={"admin"},
+        )
+        deleted_bugs = _load_deleted_bugs_for_admin(limit=120)
+        if not deleted_bugs:
+            st.caption("Papirkurven er tom.")
+        else:
+            st.caption(f"{len(deleted_bugs)} bug(s) i papirkurv")
+            for bug in deleted_bugs[:40]:
+                deleted_at_text = format_datetime_display(getattr(bug, "deleted_at", None))
+                deleted_by = str(getattr(bug, "deleted_by", "") or "-")
+                st.write(f"#{bug.id} - {bug.title} | slettet: {deleted_at_text} av {deleted_by}")
+                r_col, d_col = st.columns(2)
+                with r_col:
+                    if st.button(
+                        "Gjenopprett",
+                        key=f"admin_restore_deleted_{bug.id}",
+                        use_container_width=True,
+                    ):
+                        restore_error = _restore_deleted_bug(user, int(bug.id))
+                        if restore_error:
+                            st.error(restore_error)
+                        else:
+                            st.success(f"Bug #{bug.id} gjenopprettet.")
+                            st.rerun()
+                with d_col:
+                    if st.button(
+                        "Slett permanent",
+                        key=f"admin_hard_delete_{bug.id}",
+                        use_container_width=True,
+                        disabled=not can_permanent_delete,
+                    ):
+                        _request_delete_confirmation(prefix="admin", item_key=f"hard_delete_{bug.id}")
+                        st.rerun()
+                    if _render_delete_confirmation(
+                        prefix="admin",
+                        item_key=f"hard_delete_{bug.id}",
+                        message=f"Permanent sletting av bug #{bug.id}. Dette kan ikke angres.",
+                    ):
+                        hard_error = _hard_delete_bug(user, int(bug.id))
+                        if hard_error:
+                            st.error(hard_error)
+                        else:
+                            st.success(f"Bug #{bug.id} slettet permanent.")
+                            st.rerun()
 
         st.caption("Jobbkø (siste)")
         recent_jobs = snapshot.get("recent_jobs") if isinstance(snapshot, dict) else []
@@ -1140,7 +1305,7 @@ def _run_bug_sentiment_analysis(user: dict[str, str], bug_id: int) -> str | None
             action="sentiment_analyzed",
             details=f"label={label}, summary={summary or '-'}",
         )
-        db.commit()
+        _commit_with_retry(db, operation="Lagring av sentimentanalyse")
     _clear_bug_cache()
     return None
 
@@ -1172,7 +1337,7 @@ def _run_bug_summary(user: dict[str, str], bug_id: int) -> str | None:
             action="bug_summarized",
             details=summary[:400],
         )
-        db.commit()
+        _commit_with_retry(db, operation="Lagring av oppsummering")
     _clear_bug_cache()
     return None
 
@@ -1483,7 +1648,7 @@ def _render_assignee_sidebar_duplicates(user: dict[str, str], bugs: list[Bug]) -
                     if error:
                         st.error(error)
                     else:
-                        st.success(f"Slettet bug #{candidate['delete_bug_id']}.")
+                        st.success(f"Flyttet bug #{candidate['delete_bug_id']} til papirkurv.")
                         st.session_state["assignee_duplicate_candidates"] = _detect_duplicate_bug_pairs(
                             [bug for bug in bugs if bug.id != int(candidate["delete_bug_id"])]
                         )
@@ -1582,7 +1747,7 @@ def _render_admin_sidebar_duplicates(user: dict[str, str], bugs: list[Bug]) -> N
                     if error:
                         st.error(error)
                     else:
-                        st.success(f"Slettet bug #{candidate['delete_bug_id']}.")
+                        st.success(f"Flyttet bug #{candidate['delete_bug_id']} til papirkurv.")
                         st.session_state["admin_duplicate_candidates"] = _detect_duplicate_bug_pairs(
                             [bug for bug in bugs if bug.id != int(candidate["delete_bug_id"])]
                         )
@@ -1788,6 +1953,312 @@ def _clear_bug_cache() -> None:
         st.session_state.pop(key, None)
 
 
+def _record_runtime_metric(name: str, value: float) -> None:
+    key = "_runtime_metrics"
+    metrics = st.session_state.setdefault(key, {})
+    if not isinstance(metrics, dict):
+        metrics = {}
+        st.session_state[key] = metrics
+    values = metrics.setdefault(name, [])
+    if not isinstance(values, list):
+        values = []
+        metrics[name] = values
+    values.append(float(value))
+    if len(values) > 80:
+        del values[:-80]
+
+
+def _runtime_metric_latest(name: str) -> float:
+    metrics = st.session_state.get("_runtime_metrics", {})
+    if not isinstance(metrics, dict):
+        return 0.0
+    values = metrics.get(name)
+    if not isinstance(values, list) or not values:
+        return 0.0
+    return float(values[-1] or 0.0)
+
+
+def _runtime_metric_average(name: str) -> float:
+    metrics = st.session_state.get("_runtime_metrics", {})
+    if not isinstance(metrics, dict):
+        return 0.0
+    values = metrics.get(name)
+    if not isinstance(values, list) or not values:
+        return 0.0
+    return float(mean([float(item or 0.0) for item in values]))
+
+
+def _runtime_performance_snapshot() -> dict[str, float]:
+    return {
+        "page_reporter_ms": _runtime_metric_latest("page_reporter_ms"),
+        "page_assignee_ms": _runtime_metric_latest("page_assignee_ms"),
+        "page_admin_ms": _runtime_metric_latest("page_admin_ms"),
+        "search_reporter_ms": _runtime_metric_latest("search_reporter_ms"),
+        "search_assignee_ms": _runtime_metric_latest("search_assignee_ms"),
+        "search_admin_ms": _runtime_metric_latest("search_admin_ms"),
+        "ai_wait_avg_ms": _runtime_metric_average("ai_wait_ms"),
+        "search_avg_ms": float(get_search_telemetry_snapshot().get("avg_latency_ms", 0.0) or 0.0),
+    }
+
+
+def _is_sqlite_write_conflict(exc: Exception) -> bool:
+    message = str(exc or "").strip().casefold()
+    if "database is locked" in message:
+        return True
+    if "database table is locked" in message:
+        return True
+    if "database is busy" in message:
+        return True
+    if "resource busy" in message:
+        return True
+    return False
+
+
+def _commit_with_retry(
+    db,
+    *,
+    operation: str,
+    max_attempts: int = 5,
+    base_delay_seconds: float = 0.12,
+) -> None:
+    attempts = max(1, int(max_attempts))
+    for attempt in range(1, attempts + 1):
+        try:
+            db.commit()
+            return
+        except (OperationalError, SQLAlchemyError) as exc:
+            db.rollback()
+            if settings.database_is_sqlite and _is_sqlite_write_conflict(exc) and attempt < attempts:
+                delay = base_delay_seconds * (2 ** (attempt - 1))
+                time.sleep(min(1.2, delay))
+                continue
+            if settings.database_is_sqlite and _is_sqlite_write_conflict(exc):
+                raise RuntimeError(
+                    "En annen bruker oppdaterer databasen akkurat nå. Prøv igjen om noen sekunder."
+                ) from exc
+            raise RuntimeError(
+                format_user_error(
+                    f"{operation} feilet",
+                    exc,
+                    fallback="Databasen svarte med en feil. Prøv igjen.",
+                )
+            ) from exc
+
+
+def _runtime_meta_get(db, key: str, default: str) -> str:
+    row = db.get(AppRuntimeMeta, key)
+    if row is None or row.value is None:
+        return str(default)
+    return str(row.value)
+
+
+def _runtime_meta_set(db, key: str, value: str) -> None:
+    row = db.get(AppRuntimeMeta, key)
+    if row is None:
+        db.add(AppRuntimeMeta(key=key, value=str(value)))
+    else:
+        row.value = str(value)
+
+
+def _policy_roles(policy_key: str, default_roles: set[str]) -> set[str]:
+    try:
+        with db_session() as db:
+            raw = _runtime_meta_get(db, policy_key, ",".join(sorted(default_roles)))
+    except Exception:
+        raw = ",".join(sorted(default_roles))
+    roles = {_normalize_email(item) for item in str(raw).split(",") if str(item).strip()}
+    return {role for role in roles if role in {"admin", "assignee", "reporter"}}
+
+
+def _set_policy_roles(policy_key: str, roles: set[str], default_roles: set[str]) -> str | None:
+    normalized_roles = {str(item or "").strip().casefold() for item in roles if str(item or "").strip()}
+    valid_roles = {role for role in normalized_roles if role in {"admin", "assignee", "reporter"}}
+    if not valid_roles:
+        valid_roles = set(default_roles)
+    value = ",".join(sorted(valid_roles))
+    try:
+        with db_session() as db:
+            _runtime_meta_set(db, policy_key, value)
+            _commit_with_retry(db, operation="Lagring av policy")
+    except RuntimeError as exc:
+        return str(exc)
+    except Exception as exc:
+        return format_user_error("Kunne ikke lagre policy", exc, fallback="Prøv igjen.")
+    return None
+
+
+def _policy_allows(*, policy_key: str, user_role: str, default_roles: set[str]) -> bool:
+    allowed_roles = _policy_roles(policy_key, default_roles)
+    return str(user_role or "").strip().casefold() in allowed_roles
+
+
+def _can_user_delete_bug(user: dict[str, str]) -> bool:
+    return _policy_allows(
+        policy_key="policy.delete_roles",
+        user_role=user.get("role", ""),
+        default_roles={"admin", "assignee"},
+    )
+
+
+def _can_user_reopen_bug(user: dict[str, str]) -> bool:
+    return _policy_allows(
+        policy_key="policy.reopen_roles",
+        user_role=user.get("role", ""),
+        default_roles={"admin", "assignee", "reporter"},
+    )
+
+
+def _sqlite_db_path() -> Path | None:
+    if not settings.database_is_sqlite:
+        return None
+    value = str(settings.database_url or "").strip()
+    if not value.startswith("sqlite:///"):
+        return None
+    raw_path = value.replace("sqlite:///", "", 1)
+    return Path(raw_path).expanduser().resolve()
+
+
+def _build_backup_zip_bytes() -> tuple[bytes | None, str | None]:
+    db_path = _sqlite_db_path()
+    if db_path is None:
+        return None, "Backup via UI støttes nå kun for SQLite-profil."
+    if not db_path.exists():
+        return None, f"Fant ikke SQLite-fil: {db_path}"
+
+    tmp_dir = Path(tempfile.mkdtemp(prefix="cloudtest_backup_"))
+    try:
+        sqlite_copy = tmp_dir / "bug_tracker_cloud.db"
+        src = sqlite3.connect(str(db_path))
+        dst = sqlite3.connect(str(sqlite_copy))
+        try:
+            src.backup(dst)
+        finally:
+            dst.close()
+            src.close()
+
+        archive_io = BytesIO()
+        with zipfile.ZipFile(archive_io, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            zf.write(sqlite_copy, arcname="database/bug_tracker_cloud.db")
+            attachment_root = settings.attachment_dir
+            if attachment_root.exists():
+                for path in attachment_root.rglob("*"):
+                    if path.is_file():
+                        rel = path.relative_to(attachment_root).as_posix()
+                        zf.write(path, arcname=f"attachments/{rel}")
+            zf.writestr(
+                "metadata.json",
+                json.dumps(
+                    {
+                        "created_at": datetime.now(timezone.utc).isoformat(),
+                        "database_backend": settings.database_backend,
+                        "db_file": "database/bug_tracker_cloud.db",
+                        "attachments_root": "attachments/",
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+            )
+        archive_io.seek(0)
+        return archive_io.getvalue(), None
+    except Exception as exc:
+        return None, format_user_error("Kunne ikke lage backup", exc, fallback="Prøv igjen.")
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+def _restore_from_backup_zip(uploaded_file) -> str | None:
+    db_path = _sqlite_db_path()
+    if db_path is None:
+        return "Restore via UI støttes nå kun for SQLite-profil."
+    if uploaded_file is None:
+        return "Velg en backup-fil (.zip) først."
+    payload = uploaded_file.getvalue()
+    if not isinstance(payload, (bytes, bytearray)) or not payload:
+        return "Kunne ikke lese backup-filen."
+
+    tmp_dir = Path(tempfile.mkdtemp(prefix="cloudtest_restore_"))
+    db_tmp_path = tmp_dir / "db_restored.sqlite"
+    attachments_tmp = tmp_dir / "attachments"
+    try:
+        with zipfile.ZipFile(BytesIO(bytes(payload)), "r") as zf:
+            names = set(zf.namelist())
+            if "database/bug_tracker_cloud.db" not in names:
+                return "Backup mangler database/bug_tracker_cloud.db."
+            db_tmp_path.write_bytes(zf.read("database/bug_tracker_cloud.db"))
+            for name in names:
+                if not name.startswith("attachments/") or name.endswith("/"):
+                    continue
+                relative = name.removeprefix("attachments/").strip("/")
+                if not relative:
+                    continue
+                target = (attachments_tmp / relative).resolve()
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(zf.read(name))
+
+        backup_current = db_path.with_suffix(f"{db_path.suffix}.pre_restore.bak")
+        try:
+            if db_path.exists():
+                shutil.copy2(db_path, backup_current)
+        except Exception:
+            pass
+
+        engine.dispose()
+        for suffix in ("-wal", "-shm"):
+            extra = Path(f"{db_path}{suffix}")
+            if extra.exists():
+                try:
+                    extra.unlink()
+                except Exception:
+                    pass
+        shutil.copy2(db_tmp_path, db_path)
+
+        attachment_root = settings.attachment_dir
+        if attachment_root.exists():
+            shutil.rmtree(attachment_root, ignore_errors=True)
+        attachment_root.mkdir(parents=True, exist_ok=True)
+        if attachments_tmp.exists():
+            for src_path in attachments_tmp.rglob("*"):
+                if not src_path.is_file():
+                    continue
+                rel = src_path.relative_to(attachments_tmp)
+                dst_path = (attachment_root / rel)
+                dst_path.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(src_path, dst_path)
+
+        _clear_bug_cache()
+        return None
+    except zipfile.BadZipFile:
+        return "Ugyldig backup-fil. Forventet .zip."
+    except Exception as exc:
+        return format_user_error("Restore feilet", exc, fallback="Kunne ikke gjenopprette backup.")
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+def _mark_bug_search_index_dirty(db, *, bug_id: int) -> None:
+    embedding_provider: str | None = None
+    embedding_model: str | None = None
+    try:
+        settings_payload = _current_search_settings()
+        if isinstance(settings_payload, dict):
+            embedding_provider = str(settings_payload.get("embedding_provider") or "").strip() or None
+            embedding_model = str(settings_payload.get("embedding_model") or "").strip() or None
+    except Exception:
+        embedding_provider = None
+        embedding_model = None
+
+    try:
+        db.flush()
+        mark_bug_search_index_dirty_by_id(
+            db,
+            bug_id=bug_id,
+            embedding_provider=embedding_provider,
+            embedding_model=embedding_model,
+        )
+    except Exception as exc:  # pragma: no cover - defensive runtime guard
+        logger.warning("Failed to mark bug_search_index as dirty for bug_id=%s: %s", bug_id, exc)
+
+
 def _admin_emails() -> set[str]:
     configured = {
         item.strip().casefold()
@@ -1873,11 +2344,56 @@ def _grant_admin_access(email: str) -> str | None:
                         auth_provider="entra",
                     )
                 )
-            db.commit()
+            _commit_with_retry(db, operation="Lagring av admin-tilgang")
+    except RuntimeError as exc:
+        return str(exc)
     except SQLAlchemyError as exc:
         logger.error("Failed to grant admin access for email=%s: %s", normalized, exc)
         return f"Kunne ikke lagre admin-tilgang: {exc}"
     return None
+
+
+def _set_user_role(email: str, role: str) -> str | None:
+    normalized = _normalize_email(email)
+    desired_role = str(role or "").strip().casefold()
+    if not _is_valid_email(normalized):
+        return "Oppgi en gyldig e-postadresse."
+    if desired_role not in {"reporter", "assignee", "admin"}:
+        return "Ugyldig rolle."
+    try:
+        with db_session() as db:
+            existing = db.get(User, normalized)
+            if existing:
+                existing.role = desired_role
+                if not existing.auth_provider:
+                    existing.auth_provider = "entra"
+            else:
+                db.add(
+                    User(
+                        email=normalized,
+                        full_name=normalized.split("@", 1)[0],
+                        password_hash=get_password_hash(str(uuid4())),
+                        role=desired_role,
+                        auth_provider="entra",
+                    )
+                )
+            _commit_with_retry(db, operation="Oppdatering av rolle")
+    except RuntimeError as exc:
+        return str(exc)
+    except SQLAlchemyError as exc:
+        logger.error("Failed to set role for email=%s role=%s: %s", normalized, desired_role, exc)
+        return format_user_error("Kunne ikke lagre rolle", exc, fallback="Prøv igjen.")
+    return None
+
+
+def _list_users_with_roles() -> list[tuple[str, str, str]]:
+    try:
+        with db_session() as db:
+            rows = db.execute(select(User.email, User.role, User.auth_provider).order_by(User.role.asc(), User.email.asc())).all()
+        return [(str(email), str(role), str(auth_provider or "")) for email, role, auth_provider in rows]
+    except SQLAlchemyError as exc:
+        logger.warning("Failed to list users: %s", exc.__class__.__name__)
+        return []
 
 
 def _render_admin_access_management_sidebar(current_admin_email: str) -> None:
@@ -1908,6 +2424,80 @@ def _render_admin_access_management_sidebar(current_admin_email: str) -> None:
             suffix = " (deg)" if email == current_norm else ""
             st.write(f"- {email}{suffix}")
 
+        st.divider()
+        st.caption("Rollehåndtering")
+        users = _list_users_with_roles()
+        if users:
+            user_options = [email for email, _role, _auth in users]
+            selected_user = st.selectbox(
+                "Bruker",
+                options=user_options,
+                key="admin_role_selected_user",
+                help="Velg bruker for å oppdatere rolle.",
+            )
+            role_map = {email: role for email, role, _auth in users}
+            current_role = role_map.get(selected_user, "reporter")
+            target_role = st.selectbox(
+                "Ny rolle",
+                options=["reporter", "assignee", "admin"],
+                index=["reporter", "assignee", "admin"].index(current_role) if current_role in {"reporter", "assignee", "admin"} else 0,
+                key="admin_role_target_role",
+            )
+            if st.button("Lagre rolle", key="admin_role_save_btn", use_container_width=True):
+                error = _set_user_role(selected_user, target_role)
+                if error:
+                    st.error(error)
+                else:
+                    st.success(f"Rolle oppdatert: {selected_user} → {target_role}")
+                    _clear_bug_cache()
+                    st.rerun()
+        else:
+            st.caption("Ingen brukere å vise ennå.")
+
+        st.divider()
+        st.caption("Policy")
+        delete_roles = _policy_roles("policy.delete_roles", {"admin", "assignee"})
+        reopen_roles = _policy_roles("policy.reopen_roles", {"admin", "assignee", "reporter"})
+        hard_delete_roles = _policy_roles("policy.hard_delete_roles", {"admin"})
+
+        selected_delete_roles = set(
+            st.multiselect(
+                "Kan slette (til papirkurv)",
+                options=["reporter", "assignee", "admin"],
+                default=sorted(delete_roles),
+                key="admin_policy_delete_roles",
+            )
+        )
+        selected_reopen_roles = set(
+            st.multiselect(
+                "Kan gjenåpne løste bugs",
+                options=["reporter", "assignee", "admin"],
+                default=sorted(reopen_roles),
+                key="admin_policy_reopen_roles",
+            )
+        )
+        selected_hard_delete_roles = set(
+            st.multiselect(
+                "Kan slette permanent",
+                options=["reporter", "assignee", "admin"],
+                default=sorted(hard_delete_roles),
+                key="admin_policy_hard_delete_roles",
+            )
+        )
+        if st.button("Lagre policy", key="admin_policy_save_btn", use_container_width=True):
+            errors = [
+                _set_policy_roles("policy.delete_roles", selected_delete_roles, {"admin", "assignee"}),
+                _set_policy_roles("policy.reopen_roles", selected_reopen_roles, {"admin", "assignee", "reporter"}),
+                _set_policy_roles("policy.hard_delete_roles", selected_hard_delete_roles, {"admin"}),
+            ]
+            errors = [item for item in errors if item]
+            if errors:
+                for item in errors:
+                    st.error(item)
+            else:
+                st.success("Policy lagret.")
+                st.rerun()
+
 
 def _recover_orphan_background_jobs() -> None:
     with db_session() as db:
@@ -1924,14 +2514,29 @@ def _recover_orphan_background_jobs() -> None:
             if not row.error_message:
                 row.error_message = "Job avbrutt fordi appen ble restartet før fullføring."
             row.finished_at = finished_at
-        db.commit()
+        _commit_with_retry(db, operation="Oppdatering av bakgrunnsjobber")
 
 
 @st.cache_resource
 def _init_local_data() -> bool:
     _validate_cloud_database_profile()
     _ensure_postgresql_vector_extension()
-    Base.metadata.create_all(bind=engine)
+    migrations_ok = False
+    try:
+        run_cloudtest_migrations()
+        migrations_ok = True
+    except Exception as exc:
+        if not _allow_migration_failure_fallback():
+            raise
+        logger.warning(
+            "CloudTest migrations failed. Falling back to legacy schema bootstrap. error=%s",
+            exc,
+        )
+
+    if not migrations_ok or _legacy_schema_bootstrap_enabled():
+        Base.metadata.create_all(bind=engine)
+        run_local_schema_upgrades()
+
     _recover_orphan_background_jobs()
     if not _allow_local_login():
         return True
@@ -1953,7 +2558,7 @@ def _init_local_data() -> bool:
                     auth_provider="local",
                 )
             )
-            db.commit()
+            _commit_with_retry(db, operation="Oppretting av lokal admin")
     return True
 
 
@@ -1971,7 +2576,7 @@ def _ensure_user_exists(db, *, email: str, role: str) -> None:
     if existing:
         if existing.role != role and role == "admin":
             existing.role = role
-            db.commit()
+            _commit_with_retry(db, operation="Oppdatering av brukerrolle")
         return
     db.add(
         User(
@@ -1982,7 +2587,7 @@ def _ensure_user_exists(db, *, email: str, role: str) -> None:
             auth_provider="entra",
         )
     )
-    db.commit()
+    _commit_with_retry(db, operation="Oppretting av bruker")
 
 
 def _get_or_create_user(db, *, email: str, role: str) -> User:
@@ -2010,13 +2615,21 @@ def _current_user() -> dict[str, str] | None:
 
 def _set_user(email: str) -> None:
     role = _role_for_email(email)
-    with db_session() as db:
-        _ensure_user_exists(db, email=email, role=role)
+    try:
+        with db_session() as db:
+            _ensure_user_exists(db, email=email, role=role)
+    except RuntimeError as exc:
+        logger.warning("Unable to persist user during login: %s", exc)
+        st.session_state["_auth_error"] = str(exc)
+        return
     st.session_state["email"] = email
     st.session_state["role"] = role
 
 
 def _auth_gate() -> bool:
+    if st.session_state.get("_auth_error"):
+        st.sidebar.error(str(st.session_state.get("_auth_error")))
+        st.session_state.pop("_auth_error", None)
     return _render_auth_gate(
         allow_local_login=_allow_local_login,
         current_user=_current_user,
@@ -2030,11 +2643,26 @@ def _auth_gate() -> bool:
 
 def _load_bugs_for_user(user: dict[str, str]) -> list[Bug]:
     with db_session() as db:
-        query = select(Bug).order_by(Bug.created_at.desc())
+        query = select(Bug).where(Bug.deleted_at.is_(None)).order_by(Bug.created_at.desc())
         bugs = list(db.scalars(query).unique().all())
         if user["role"] in {"admin", "assignee"}:
             return bugs
         return [bug for bug in bugs if (bug.reporter_id or "").casefold() == user["email"].casefold()]
+
+
+def _load_deleted_bugs_for_admin(*, limit: int = 100) -> list[Bug]:
+    with db_session() as db:
+        query = (
+            select(Bug)
+            .where(Bug.deleted_at.is_not(None))
+            .order_by(Bug.deleted_at.desc(), Bug.id.desc())
+            .limit(max(1, int(limit)))
+        )
+        return list(db.scalars(query).unique().all())
+
+
+def _is_deleted_bug(bug: Bug) -> bool:
+    return bool(getattr(bug, "deleted_at", None))
 
 
 def _load_bugs_for_user_cached(user: dict[str, str], ttl_seconds: int = 8) -> list[Bug]:
@@ -2047,7 +2675,7 @@ def _load_bugs_for_user_cached(user: dict[str, str], ttl_seconds: int = 8) -> li
 
 def _prepare_page_bug_list(*, user: dict[str, str], prefix: str) -> list[Bug]:
     _render_ai_and_embedding_sidebar_settings(prefix=prefix)
-    _render_system_and_ops_sidebar(jobs=_background_jobs_snapshot())
+    _render_system_and_ops_sidebar(jobs=_background_jobs_snapshot(), telemetry=_runtime_performance_snapshot())
     if render_sidebar_refresh_button(prefix):
         _clear_bug_cache()
         st.rerun()
@@ -2065,6 +2693,7 @@ def _prepare_page_bug_list(*, user: dict[str, str], prefix: str) -> list[Bug]:
     vector_search_active = False
     if query:
         search_settings = _current_search_settings()
+        started = time.perf_counter()
         try:
             with db_session() as db:
                 db_user = _get_or_create_user(db, email=user["email"], role=user["role"])
@@ -2087,6 +2716,9 @@ def _prepare_page_bug_list(*, user: dict[str, str], prefix: str) -> list[Bug]:
                 exc.__class__.__name__,
             )
             st.warning(format_user_error("Vektorsøk feilet", exc, fallback="Bruker lokal søkefallback i denne visningen."))
+        finally:
+            elapsed_ms = (time.perf_counter() - started) * 1000.0
+            _record_runtime_metric(f"search_{prefix}_ms", elapsed_ms)
 
     st.session_state[f"{prefix}_vector_search_active"] = vector_search_active
     return apply_sidebar_bug_filters(
@@ -2165,78 +2797,84 @@ def _create_bug(
     if assignee_clean and allowed_assignees is not None and assignee_clean not in allowed_assignees:
         return "Tildelt bruker er ikke i listen over gyldige tildelbare brukere."
 
-    with db_session() as db:
-        _ensure_user_exists(db, email=user["email"], role=user["role"])
-        if assignee_clean:
-            _ensure_user_exists(db, email=assignee_clean, role=_role_for_email(assignee_clean))
-        bug = Bug(
-            title=title_clean,
-            description=description_clean,
-            category=category_clean,
-            severity=severity_clean,
-            status="open",
-            environment=environment_clean,
-            tags=tags_clean,
-            notify_emails=notify_clean,
-            reporter_id=user["email"],
-            assignee_id=assignee_clean,
-            reporting_date=datetime.now(timezone.utc),
-        )
-        db.add(bug)
-        db.flush()
-
-        uploaded_files = list(attachments or [])
-        upload_errors: list[str] = []
-        if len(uploaded_files) > MAX_ATTACHMENTS_PER_UPLOAD:
-            upload_errors.append(f"Maks {MAX_ATTACHMENTS_PER_UPLOAD} vedlegg per innsending.")
-            uploaded_files = uploaded_files[:MAX_ATTACHMENTS_PER_UPLOAD]
-
-        for upload in uploaded_files:
-            file_name = str(getattr(upload, "name", "") or "").strip()
-            if not file_name:
-                continue
-            content = upload.getvalue()
-            if not isinstance(content, (bytes, bytearray)):
-                continue
-            if len(content) > MAX_ATTACHMENT_BYTES:
-                upload_errors.append(f"{file_name}: for stor fil (>{MAX_ATTACHMENT_BYTES // (1024 * 1024)} MB).")
-                continue
-
-            try:
-                storage_ref = _ATTACHMENT_STORAGE.store_bytes(
-                    payload=bytes(content),
-                    file_name=file_name,
-                    bug_id=bug.id,
-                )
-            except AttachmentStorageError as exc:
-                upload_errors.append(f"{file_name}: lagring feilet ({exc}).")
-                continue
-
-            db.add(
-                Attachment(
-                    bug_id=bug.id,
-                    filename=file_name,
-                    content_type=str(getattr(upload, "type", "") or None),
-                    storage_path=str(storage_ref),
-                    uploaded_by=user["email"],
-                )
+    try:
+        with db_session() as db:
+            _ensure_user_exists(db, email=user["email"], role=user["role"])
+            if assignee_clean:
+                _ensure_user_exists(db, email=assignee_clean, role=_role_for_email(assignee_clean))
+            bug = Bug(
+                title=title_clean,
+                description=description_clean,
+                category=category_clean,
+                severity=severity_clean,
+                status="open",
+                environment=environment_clean,
+                tags=tags_clean,
+                notify_emails=notify_clean,
+                reporter_id=user["email"],
+                assignee_id=assignee_clean,
+                reporting_date=datetime.now(timezone.utc),
             )
-        _write_history(
-            db,
-            bug_id=bug.id,
-            actor_email=user["email"],
-            action="created",
-            details=f"Bug opprettet av {user['email']}",
-        )
-        if upload_errors:
+            db.add(bug)
+            db.flush()
+
+            uploaded_files = list(attachments or [])
+            upload_errors: list[str] = []
+            if len(uploaded_files) > MAX_ATTACHMENTS_PER_UPLOAD:
+                upload_errors.append(f"Maks {MAX_ATTACHMENTS_PER_UPLOAD} vedlegg per innsending.")
+                uploaded_files = uploaded_files[:MAX_ATTACHMENTS_PER_UPLOAD]
+
+            for upload in uploaded_files:
+                file_name = str(getattr(upload, "name", "") or "").strip()
+                if not file_name:
+                    continue
+                content = upload.getvalue()
+                if not isinstance(content, (bytes, bytearray)):
+                    continue
+                if len(content) > MAX_ATTACHMENT_BYTES:
+                    upload_errors.append(f"{file_name}: for stor fil (>{MAX_ATTACHMENT_BYTES // (1024 * 1024)} MB).")
+                    continue
+
+                try:
+                    storage_ref = _ATTACHMENT_STORAGE.store_bytes(
+                        payload=bytes(content),
+                        file_name=file_name,
+                        bug_id=bug.id,
+                    )
+                except AttachmentStorageError as exc:
+                    upload_errors.append(f"{file_name}: lagring feilet ({exc}).")
+                    continue
+
+                db.add(
+                    Attachment(
+                        bug_id=bug.id,
+                        filename=file_name,
+                        content_type=str(getattr(upload, "type", "") or None),
+                        storage_path=str(storage_ref),
+                        uploaded_by=user["email"],
+                    )
+                )
             _write_history(
                 db,
                 bug_id=bug.id,
                 actor_email=user["email"],
-                action="attachment_warning",
-                details=" | ".join(upload_errors)[:1000],
+                action="created",
+                details=f"Bug opprettet av {user['email']}",
             )
-        db.commit()
+            if upload_errors:
+                _write_history(
+                    db,
+                    bug_id=bug.id,
+                    actor_email=user["email"],
+                    action="attachment_warning",
+                    details=" | ".join(upload_errors)[:1000],
+                )
+            _mark_bug_search_index_dirty(db, bug_id=bug.id)
+            _commit_with_retry(db, operation="Oppretting av bug")
+    except RuntimeError as exc:
+        return str(exc)
+    except SQLAlchemyError as exc:
+        return format_user_error("Kunne ikke opprette bug", exc, fallback="Databasen svarte med en feil.")
     _clear_bug_cache()
     return None
 
@@ -2252,12 +2890,15 @@ def _upload_attachments_for_bug(user: dict[str, str], bug_id: int, attachments: 
         uploaded_files = uploaded_files[:MAX_ATTACHMENTS_PER_UPLOAD]
 
     uploaded_count = 0
-    with db_session() as db:
-        bug = db.get(Bug, bug_id)
-        if not bug:
-            return ["Fant ikke bug."]
-        if normalize_bug_status(bug.status) == "resolved":
-            return ["Bugen er løst og kan ikke oppdateres. Sett status tilbake til Åpen først."]
+    try:
+        with db_session() as db:
+            bug = db.get(Bug, bug_id)
+            if not bug:
+                return ["Fant ikke bug."]
+            if _is_deleted_bug(bug):
+                return ["Bugen er i papirkurv og kan ikke oppdateres."]
+            if normalize_bug_status(bug.status) == "resolved":
+                return ["Bugen er løst og kan ikke oppdateres. Sett status tilbake til Åpen først."]
 
         for upload in uploaded_files:
             file_name = str(getattr(upload, "name", "") or "").strip()
@@ -2308,8 +2949,14 @@ def _upload_attachments_for_bug(user: dict[str, str], bug_id: int, attachments: 
                 action="attachment_warning",
                 details=" | ".join(upload_errors)[:1000],
             )
-        if uploaded_count > 0 or upload_errors:
-            db.commit()
+            if uploaded_count > 0:
+                _mark_bug_search_index_dirty(db, bug_id=bug.id)
+            if uploaded_count > 0 or upload_errors:
+                _commit_with_retry(db, operation="Opplasting av vedlegg")
+    except RuntimeError as exc:
+        return [str(exc)]
+    except SQLAlchemyError as exc:
+        return [format_user_error("Kunne ikke laste opp vedlegg", exc, fallback="Databasen svarte med en feil.")]
     _clear_bug_cache()
     return upload_errors
 
@@ -2318,28 +2965,36 @@ def _add_comment(user: dict[str, str], bug_id: int, body: str) -> str | None:
     text = body.strip()
     if not text:
         return "Kommentaren er tom."
-    with db_session() as db:
-        bug = db.get(Bug, bug_id)
-        if not bug:
-            return "Fant ikke bug."
-        if normalize_bug_status(bug.status) == "resolved":
-            return "Bugen er løst og kan ikke oppdateres. Sett status tilbake til Åpen først."
-        db.add(
-            BugComment(
-                bug_id=bug.id,
-                author_email=user["email"],
-                author_role=user["role"],
-                body=text,
+    try:
+        with db_session() as db:
+            bug = db.get(Bug, bug_id)
+            if not bug:
+                return "Fant ikke bug."
+            if _is_deleted_bug(bug):
+                return "Bugen er i papirkurv og kan ikke oppdateres."
+            if normalize_bug_status(bug.status) == "resolved":
+                return "Bugen er løst og kan ikke oppdateres. Sett status tilbake til Åpen først."
+            db.add(
+                BugComment(
+                    bug_id=bug.id,
+                    author_email=user["email"],
+                    author_role=user["role"],
+                    body=text,
+                )
             )
-        )
-        _write_history(
-            db,
-            bug_id=bug.id,
-            actor_email=user["email"],
-            action="comment_added",
-            details=text[:400],
-        )
-        db.commit()
+            _write_history(
+                db,
+                bug_id=bug.id,
+                actor_email=user["email"],
+                action="comment_added",
+                details=text[:400],
+            )
+            _mark_bug_search_index_dirty(db, bug_id=bug.id)
+            _commit_with_retry(db, operation="Lagring av kommentar")
+    except RuntimeError as exc:
+        return str(exc)
+    except SQLAlchemyError as exc:
+        return format_user_error("Kunne ikke lagre kommentar", exc, fallback="Databasen svarte med en feil.")
     _clear_bug_cache()
     return None
 
@@ -2371,86 +3026,176 @@ def _update_bug(
         candidate = str(reporter_satisfaction or "").strip()
         satisfaction_clean = candidate if candidate in REPORTER_SATISFACTION_OPTIONS else None
 
-    with db_session() as db:
-        bug = db.get(Bug, bug_id)
-        if not bug:
-            return "Fant ikke bug."
+    try:
+        with db_session() as db:
+            bug = db.get(Bug, bug_id)
+            if not bug:
+                return "Fant ikke bug."
+            if _is_deleted_bug(bug):
+                return "Bugen ligger i papirkurv. Gjenopprett bugen før oppdatering."
 
-        current_status = normalize_bug_status(bug.status)
-        if current_status == "resolved":
-            if status_clean != "open":
-                return "Bugen er løst og kan ikke oppdateres. Sett status tilbake til Åpen først."
-            bug.status = "open"
-            bug.closed_at = None
+            current_status = normalize_bug_status(bug.status)
+            if current_status == "resolved":
+                if status_clean != "open":
+                    return "Bugen er løst og kan ikke oppdateres. Sett status tilbake til Åpen først."
+                if not _policy_allows(
+                    policy_key="policy.reopen_roles",
+                    user_role=user["role"],
+                    default_roles={"admin", "assignee", "reporter"},
+                ):
+                    return "Du har ikke rettighet til å gjenåpne løste bugs."
+                bug.status = "open"
+                bug.closed_at = None
+                _write_history(
+                    db,
+                    bug_id=bug.id,
+                    actor_email=user["email"],
+                    action="reopened",
+                    details="Bug satt tilbake til Åpen.",
+                )
+                _mark_bug_search_index_dirty(db, bug_id=bug.id)
+                _commit_with_retry(db, operation="Gjenåpning av bug")
+                _clear_bug_cache()
+                return None
+
+            if assignee_clean and not _is_valid_email(assignee_clean):
+                return "Tildelt e-postadresse er ugyldig."
+            if invalid_notify:
+                return f"Ugyldige e-postadresser i varsling: {', '.join(invalid_notify)}"
+
+            if assignee_clean:
+                _ensure_user_exists(db, email=assignee_clean, role=_role_for_email(assignee_clean))
+            bug.status = status_clean
+            bug.severity = severity_clean
+            bug.assignee_id = assignee_clean
+            if category_clean:
+                bug.category = category_clean
+            if environment is not None:
+                bug.environment = str(environment).strip() or None
+            if tags is not None:
+                bug.tags = str(tags).strip() or None
+            if notify_emails is not None:
+                bug.notify_emails = notify_clean
+            if description is not None and description_clean:
+                bug.description = description_clean
+            if reporter_satisfaction is not None:
+                bug.reporter_satisfaction = satisfaction_clean
+
+            if status_clean == "resolved" and bug.closed_at is None:
+                bug.closed_at = datetime.now(timezone.utc)
+            if status_clean != "resolved":
+                bug.closed_at = None
             _write_history(
                 db,
                 bug_id=bug.id,
                 actor_email=user["email"],
-                action="reopened",
-                details="Bug satt tilbake til Åpen.",
+                action="updated",
+                details=(
+                    f"status={status_clean}, severity={severity_clean}, "
+                    f"assignee={assignee_clean or '-'}, satisfaction={satisfaction_clean or '-'}"
+                ),
             )
-            db.commit()
-            _clear_bug_cache()
-            return None
-
-        if assignee_clean and not _is_valid_email(assignee_clean):
-            return "Tildelt e-postadresse er ugyldig."
-        if invalid_notify:
-            return f"Ugyldige e-postadresser i varsling: {', '.join(invalid_notify)}"
-
-        if assignee_clean:
-            _ensure_user_exists(db, email=assignee_clean, role=_role_for_email(assignee_clean))
-        bug.status = status_clean
-        bug.severity = severity_clean
-        bug.assignee_id = assignee_clean
-        if category_clean:
-            bug.category = category_clean
-        if environment is not None:
-            bug.environment = str(environment).strip() or None
-        if tags is not None:
-            bug.tags = str(tags).strip() or None
-        if notify_emails is not None:
-            bug.notify_emails = notify_clean
-        if description is not None and description_clean:
-            bug.description = description_clean
-        if reporter_satisfaction is not None:
-            bug.reporter_satisfaction = satisfaction_clean
-
-        if status_clean == "resolved" and bug.closed_at is None:
-            bug.closed_at = datetime.now(timezone.utc)
-        if status_clean != "resolved":
-            bug.closed_at = None
-        _write_history(
-            db,
-            bug_id=bug.id,
-            actor_email=user["email"],
-            action="updated",
-            details=(
-                f"status={status_clean}, severity={severity_clean}, "
-                f"assignee={assignee_clean or '-'}, satisfaction={satisfaction_clean or '-'}"
-            ),
-        )
-        db.commit()
+            _mark_bug_search_index_dirty(db, bug_id=bug.id)
+            _commit_with_retry(db, operation="Oppdatering av bug")
+    except RuntimeError as exc:
+        return str(exc)
+    except SQLAlchemyError as exc:
+        return format_user_error("Kunne ikke oppdatere bug", exc, fallback="Databasen svarte med en feil.")
     _clear_bug_cache()
     return None
 
 
 def _delete_bug(user: dict[str, str], bug_id: int) -> str | None:
-    with db_session() as db:
-        bug = db.get(Bug, bug_id)
-        if not bug:
-            return "Fant ikke bug."
-        attachments = list(bug.attachments or [])
-        for item in attachments:
-            storage_ref = str(item.storage_path or "").strip()
-            if not storage_ref:
-                continue
-            try:
-                _ATTACHMENT_STORAGE.delete(storage_ref)
-            except AttachmentStorageError:
-                pass
-        db.delete(bug)
-        db.commit()
+    if not _policy_allows(
+        policy_key="policy.delete_roles",
+        user_role=user["role"],
+        default_roles={"admin", "assignee"},
+    ):
+        return "Du har ikke rettighet til å slette bugs."
+    try:
+        with db_session() as db:
+            bug = db.get(Bug, bug_id)
+            if not bug:
+                return "Fant ikke bug."
+            if _is_deleted_bug(bug):
+                return "Bugen ligger allerede i papirkurv."
+            bug.deleted_at = datetime.now(timezone.utc)
+            bug.deleted_by = user["email"]
+            _write_history(
+                db,
+                bug_id=bug.id,
+                actor_email=user["email"],
+                action="soft_deleted",
+                details=f"Flyttet til papirkurv av {user['email']}.",
+            )
+            index_row = db.get(BugSearchIndex, bug.id)
+            if index_row is not None:
+                db.delete(index_row)
+            _commit_with_retry(db, operation="Flytting til papirkurv")
+    except RuntimeError as exc:
+        return str(exc)
+    except SQLAlchemyError as exc:
+        return format_user_error("Kunne ikke flytte bug til papirkurv", exc, fallback="Databasen svarte med en feil.")
+    _clear_bug_cache()
+    return None
+
+
+def _restore_deleted_bug(user: dict[str, str], bug_id: int) -> str | None:
+    if str(user.get("role") or "").strip().casefold() != "admin":
+        return "Kun admin kan gjenopprette bugs fra papirkurv."
+    try:
+        with db_session() as db:
+            bug = db.get(Bug, bug_id)
+            if not bug:
+                return "Fant ikke bug."
+            if not _is_deleted_bug(bug):
+                return "Bugen ligger ikke i papirkurv."
+            bug.deleted_at = None
+            bug.deleted_by = None
+            _write_history(
+                db,
+                bug_id=bug.id,
+                actor_email=user["email"],
+                action="restored",
+                details="Gjenopprettet fra papirkurv.",
+            )
+            _mark_bug_search_index_dirty(db, bug_id=bug.id)
+            _commit_with_retry(db, operation="Gjenoppretting av bug")
+    except RuntimeError as exc:
+        return str(exc)
+    except SQLAlchemyError as exc:
+        return format_user_error("Kunne ikke gjenopprette bug", exc, fallback="Databasen svarte med en feil.")
+    _clear_bug_cache()
+    return None
+
+
+def _hard_delete_bug(user: dict[str, str], bug_id: int) -> str | None:
+    if not _policy_allows(
+        policy_key="policy.hard_delete_roles",
+        user_role=user["role"],
+        default_roles={"admin"},
+    ):
+        return "Du har ikke rettighet til permanent sletting."
+    try:
+        with db_session() as db:
+            bug = db.get(Bug, bug_id)
+            if not bug:
+                return "Fant ikke bug."
+            attachments = list(bug.attachments or [])
+            for item in attachments:
+                storage_ref = str(item.storage_path or "").strip()
+                if not storage_ref:
+                    continue
+                try:
+                    _ATTACHMENT_STORAGE.delete(storage_ref)
+                except AttachmentStorageError:
+                    pass
+            db.delete(bug)
+            _commit_with_retry(db, operation="Permanent sletting av bug")
+    except RuntimeError as exc:
+        return str(exc)
+    except SQLAlchemyError as exc:
+        return format_user_error("Kunne ikke slette bug permanent", exc, fallback="Databasen svarte med en feil.")
     _clear_bug_cache()
     return None
 
@@ -2674,22 +3419,30 @@ def _page_render_deps() -> dict[str, Any]:
 
 
 def _render_reporter_page(user: dict[str, str]) -> None:
+    started = time.perf_counter()
     _render_reporter_page_module(user, **_page_render_deps())
+    _record_runtime_metric("page_reporter_ms", (time.perf_counter() - started) * 1000.0)
 
 
 def _render_assignee_page(user: dict[str, str]) -> None:
+    started = time.perf_counter()
     _render_assignee_page_module(user, **_page_render_deps())
+    _record_runtime_metric("page_assignee_ms", (time.perf_counter() - started) * 1000.0)
 
 
 def _render_admin_page(user: dict[str, str]) -> None:
+    started = time.perf_counter()
     _render_admin_page_module(user, **_page_render_deps())
+    _record_runtime_metric("page_admin_ms", (time.perf_counter() - started) * 1000.0)
 
 
 def main() -> None:
+    init_started_at = time.perf_counter()
     st.set_page_config(page_title="AI-drevet bugsystem", layout="wide")
     apply_shared_app_style()
     try:
-        _init_local_data()
+        with st.spinner("Starter app og klargjør data ..."):
+            _init_local_data()
     except Exception as exc:
         logger.exception("CloudTest startup failed")
         detail = str(exc).strip()
@@ -2705,7 +3458,11 @@ def main() -> None:
             )
         return
 
+    init_duration = time.perf_counter() - init_started_at
+
     render_sidebar_logo(app_title="AI-drevet bugsystem")
+    if init_duration >= 2.0:
+        st.sidebar.caption(f"Oppstartstid: {init_duration:.1f} s")
     st.title("AI-drevet bugsystem")
     if not _auth_gate():
         return

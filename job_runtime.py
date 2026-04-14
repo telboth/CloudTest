@@ -7,9 +7,38 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from typing import Any, Callable, Mapping
 
+from sqlalchemy.exc import SQLAlchemyError
+
 _BG_EXECUTOR = ThreadPoolExecutor(max_workers=4)
 _BG_FUTURES: dict[int, Any] = {}
 _BG_FUTURES_LOCK = threading.Lock()
+
+
+def _is_sqlite_lock_error(exc: Exception) -> bool:
+    message = str(exc or "").strip().casefold()
+    return any(
+        marker in message
+        for marker in (
+            "database is locked",
+            "database table is locked",
+            "database is busy",
+            "resource busy",
+        )
+    )
+
+
+def _commit_with_retry(db, *, max_attempts: int = 5, base_delay: float = 0.08) -> None:
+    attempts = max(1, int(max_attempts))
+    for attempt in range(1, attempts + 1):
+        try:
+            db.commit()
+            return
+        except SQLAlchemyError as exc:
+            db.rollback()
+            if _is_sqlite_lock_error(exc) and attempt < attempts:
+                time.sleep(min(1.0, base_delay * (2 ** (attempt - 1))))
+                continue
+            raise
 
 
 def serialize_background_job(job: Any) -> dict[str, Any]:
@@ -18,6 +47,12 @@ def serialize_background_job(job: Any) -> dict[str, Any]:
     started_at = job.started_at
     finished_at = job.finished_at
     updated_at = finished_at or started_at or created_at
+    queue_latency_ms = None
+    run_duration_ms = None
+    if created_at and started_at:
+        queue_latency_ms = max(0.0, (started_at - created_at).total_seconds() * 1000.0)
+    if started_at and finished_at:
+        run_duration_ms = max(0.0, (finished_at - started_at).total_seconds() * 1000.0)
     return {
         "id": int(job.id),
         "prefix": str(payload.get("prefix") or ""),
@@ -32,6 +67,8 @@ def serialize_background_job(job: Any) -> dict[str, Any]:
         "updated_at": updated_at.isoformat() if updated_at else "",
         "started_at": started_at.isoformat() if started_at else "",
         "finished_at": finished_at.isoformat() if finished_at else "",
+        "queue_latency_ms": queue_latency_ms,
+        "run_duration_ms": run_duration_ms,
     }
 
 
@@ -72,7 +109,7 @@ def start_background_job(
             bug_id=bug_id if bug_id > 0 else None,
         )
         db.add(row)
-        db.commit()
+        _commit_with_retry(db)
         db.refresh(row)
         job_id = int(row.id)
         created_at_iso = row.created_at.isoformat() if row.created_at else datetime.now(timezone.utc).isoformat()
@@ -91,7 +128,7 @@ def start_background_job(
             if row:
                 row.status = "running"
                 row.started_at = datetime.now(timezone.utc)
-                db.commit()
+                _commit_with_retry(db)
         try:
             result = target()
             with db_session() as db:
@@ -101,7 +138,7 @@ def start_background_job(
                     row.result_json = json_safe_payload(result)
                     row.error_message = None
                     row.finished_at = datetime.now(timezone.utc)
-                    db.commit()
+                    _commit_with_retry(db)
         except Exception as exc:
             if logger is not None:
                 logger.exception("Background job failed: id=%s key=%s bug_id=%s", job_id, job_key, bug_id)
@@ -111,7 +148,7 @@ def start_background_job(
                     row.status = "failed"
                     row.error_message = f"{exc.__class__.__name__}: {exc}"
                     row.finished_at = datetime.now(timezone.utc)
-                    db.commit()
+                    _commit_with_retry(db)
 
     future = _BG_EXECUTOR.submit(_runner)
     with _BG_FUTURES_LOCK:

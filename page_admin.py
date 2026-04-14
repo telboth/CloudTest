@@ -33,6 +33,8 @@ def render_admin_page(user: dict[str, str], **deps: Any) -> None:
     _request_delete_confirmation = deps["_request_delete_confirmation"]
     _render_delete_confirmation = deps["_render_delete_confirmation"]
     _delete_bug = deps["_delete_bug"]
+    _can_user_delete_bug = deps["_can_user_delete_bug"]
+    _can_user_reopen_bug = deps["_can_user_reopen_bug"]
     _run_bug_summary = deps["_run_bug_summary"]
     normalize_bug_status = deps["normalize_bug_status"]
     _render_bug_thread = deps["_render_bug_thread"]
@@ -69,7 +71,7 @@ def render_admin_page(user: dict[str, str], **deps: Any) -> None:
         st.info("Ingen bugs å vise med gjeldende admin-filtre.")
         return
 
-    visible_count = render_bug_list_controls(prefix="admin", total_count=len(bugs), default_visible=15)
+    visible_count = render_bug_list_controls(prefix="admin", total_count=len(bugs), default_visible=8)
     st.caption(f"Viser {min(len(bugs), visible_count)} av {len(bugs)} bugs.")
     visible_bugs = bugs[:visible_count]
     _prefetch_bug_details(visible_bugs)
@@ -159,7 +161,8 @@ def render_admin_page(user: dict[str, str], **deps: Any) -> None:
                     "Slett bug",
                     key=f"admin_delete_{bug.id}",
                     use_container_width=True,
-                    help="Sletter bugen permanent fra systemet.",
+                    help="Flytter bugen til papirkurv.",
+                    disabled=not _can_user_delete_bug(user),
                 )
             with a3:
                 summarize_clicked = st.button(
@@ -195,7 +198,7 @@ def render_admin_page(user: dict[str, str], **deps: Any) -> None:
                 if error:
                     st.error(error)
                 else:
-                    st.success("Bug slettet.")
+                    st.success("Bug flyttet til papirkurv.")
                     st.session_state.pop("admin_duplicate_candidates", None)
                     st.rerun()
 
@@ -225,7 +228,7 @@ def render_admin_page(user: dict[str, str], **deps: Any) -> None:
                     "Gjenåpne bug",
                     key=f"admin_reopen_bug_{bug.id}",
                     use_container_width=True,
-                    disabled=normalize_bug_status(bug.status) != "resolved",
+                    disabled=(normalize_bug_status(bug.status) != "resolved") or (not _can_user_reopen_bug(user)),
                 )
 
             if close_clicked or reopen_clicked:
@@ -333,20 +336,23 @@ def render_admin_page(user: dict[str, str], **deps: Any) -> None:
                     disabled=is_resolved,
                 )
 
-            admin_note = st.text_area(
-                "Arbeidsnotat",
-                key=f"admin_note_{bug.id}",
-                height=90,
-                placeholder="Skriv intern oppdatering som publiseres i samtalen.",
-                disabled=is_resolved,
-            )
-            new_attachments = st.file_uploader(
-                "Last opp vedlegg",
-                accept_multiple_files=True,
-                key=f"admin_new_attachments_{bug.id}",
-                help=f"Maks {MAX_ATTACHMENTS_PER_UPLOAD} filer, opptil {MAX_ATTACHMENT_BYTES // (1024 * 1024)} MB per fil.",
-                disabled=is_resolved,
-            )
+            note_col, upload_col = st.columns([1.8, 1.2])
+            with note_col:
+                admin_note = st.text_area(
+                    "Arbeidsnotat",
+                    key=f"admin_note_{bug.id}",
+                    height=90,
+                    placeholder="Skriv intern oppdatering som publiseres i samtalen.",
+                    disabled=is_resolved,
+                )
+            with upload_col:
+                new_attachments = st.file_uploader(
+                    "Last opp vedlegg",
+                    accept_multiple_files=True,
+                    key=f"admin_new_attachments_{bug.id}",
+                    help=f"Maks {MAX_ATTACHMENTS_PER_UPLOAD} filer, opptil {MAX_ATTACHMENT_BYTES // (1024 * 1024)} MB per fil.",
+                    disabled=is_resolved,
+                )
 
             if st.button("Lagre endringer", key=f"admin_save_{bug.id}", use_container_width=True, disabled=is_resolved):
                 error = _update_bug(

@@ -16,7 +16,7 @@ if (Test-Path $pidsDir) {
     }
 }
 
-foreach ($port in @(8010, 8601, 8602, 8603)) {
+foreach ($port in @(8601, 8602, 8603)) {
     $connections = @(Get-NetTCPConnection -LocalPort $port -ErrorAction SilentlyContinue | Select-Object -ExpandProperty OwningProcess -Unique)
     foreach ($procId in $connections) {
         if ($procId) {

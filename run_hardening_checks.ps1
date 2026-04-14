@@ -12,7 +12,13 @@ Write-Host "Kjorer compile-sjekk..."
     "$cloudRoot\unified_app.py" `
     "$cloudRoot\foundation.py" `
     "$cloudRoot\storage_backend.py" `
-    "$cloudRoot\parity_smoke_test.py"
+    "$cloudRoot\parity_smoke_test.py" `
+    "$cloudRoot\scripts\db_maintenance.py" `
+    "$cloudRoot\scripts\db_verify.py" `
+    "$cloudRoot\app\services\migrations.py"
+
+Write-Host "Kjorer DB-verifisering..."
+& $PythonExe "$cloudRoot\scripts\db_verify.py" --strict
 
 Write-Host "Kjorer parity smoke-test..."
 & $PythonExe "$cloudRoot\parity_smoke_test.py"

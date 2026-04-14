@@ -44,6 +44,8 @@ def render_assignee_page(user: dict[str, str], **deps: Any) -> None:
     _request_delete_confirmation = deps["_request_delete_confirmation"]
     _render_delete_confirmation = deps["_render_delete_confirmation"]
     _delete_bug = deps["_delete_bug"]
+    _can_user_delete_bug = deps["_can_user_delete_bug"]
+    _can_user_reopen_bug = deps["_can_user_reopen_bug"]
     _update_bug = deps["_update_bug"]
     _upload_attachments_for_bug = deps["_upload_attachments_for_bug"]
     _add_comment = deps["_add_comment"]
@@ -82,7 +84,7 @@ def render_assignee_page(user: dict[str, str], **deps: Any) -> None:
     if not bugs:
         st.info("Ingen bugs å vise med gjeldende assignee-filtre.")
         return
-    visible_count = render_bug_list_controls(prefix="assignee", total_count=len(bugs), default_visible=10)
+    visible_count = render_bug_list_controls(prefix="assignee", total_count=len(bugs), default_visible=5)
     st.caption(f"Viser {min(len(bugs), visible_count)} av {len(bugs)} bugs.")
     visible_bugs = bugs[:visible_count]
     _prefetch_bug_details(visible_bugs)
@@ -280,19 +282,22 @@ def render_assignee_page(user: dict[str, str], **deps: Any) -> None:
                     disabled=is_resolved,
                 )
 
-            note = st.text_area(
-                "Arbeidsnotater og forslag til løsning",
-                key=_assignee_note_key(bug.id),
-                height=90,
-                disabled=is_resolved,
-            )
-            new_attachments = st.file_uploader(
-                "Last opp vedlegg",
-                accept_multiple_files=True,
-                key=f"assignee_new_attachments_{bug.id}",
-                help=f"Maks {MAX_ATTACHMENTS_PER_UPLOAD} filer, opptil {MAX_ATTACHMENT_BYTES // (1024 * 1024)} MB per fil.",
-                disabled=is_resolved,
-            )
+            note_col, upload_col = st.columns([1.8, 1.2])
+            with note_col:
+                note = st.text_area(
+                    "Arbeidsnotater og forslag til løsning",
+                    key=_assignee_note_key(bug.id),
+                    height=90,
+                    disabled=is_resolved,
+                )
+            with upload_col:
+                new_attachments = st.file_uploader(
+                    "Last opp vedlegg",
+                    accept_multiple_files=True,
+                    key=f"assignee_new_attachments_{bug.id}",
+                    help=f"Maks {MAX_ATTACHMENTS_PER_UPLOAD} filer, opptil {MAX_ATTACHMENT_BYTES // (1024 * 1024)} MB per fil.",
+                    disabled=is_resolved,
+                )
 
             if suggest_solution_clicked:
                 with st.spinner("Genererer løsningsforslag..."):
@@ -350,13 +355,14 @@ def render_assignee_page(user: dict[str, str], **deps: Any) -> None:
                     "Sett tilbake til Åpen",
                     key=f"assignee_reopen_{bug.id}",
                     use_container_width=True,
-                    disabled=not is_resolved,
+                    disabled=(not is_resolved) or (not _can_user_reopen_bug(user)),
                 )
             with action_b3:
                 delete_clicked = st.button(
                     "Slett bug",
                     key=f"assignee_delete_{bug.id}",
                     use_container_width=True,
+                    disabled=not _can_user_delete_bug(user),
                 )
 
             if reopen_clicked:
@@ -388,7 +394,7 @@ def render_assignee_page(user: dict[str, str], **deps: Any) -> None:
                 if delete_error:
                     st.error(delete_error)
                 else:
-                    st.success("Bug slettet.")
+                    st.success("Bug flyttet til papirkurv.")
                     st.session_state.pop("assignee_duplicate_candidates", None)
                     st.rerun()
 

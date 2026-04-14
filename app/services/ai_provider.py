@@ -13,14 +13,26 @@ try:
 except ImportError:  # pragma: no cover - optional dependency at runtime
     OpenAI = None  # type: ignore[assignment]
 
-try:
-    from sentence_transformers import SentenceTransformer
-except ImportError:  # pragma: no cover - optional dependency at runtime
-    SentenceTransformer = None  # type: ignore[assignment]
+_SENTENCE_TRANSFORMER_CLASS = None
+_SENTENCE_TRANSFORMER_IMPORT_ATTEMPTED = False
 
 
 class AIProviderError(RuntimeError):
     pass
+
+
+def _get_sentence_transformer_class():
+    global _SENTENCE_TRANSFORMER_CLASS, _SENTENCE_TRANSFORMER_IMPORT_ATTEMPTED
+    if _SENTENCE_TRANSFORMER_IMPORT_ATTEMPTED:
+        return _SENTENCE_TRANSFORMER_CLASS
+    _SENTENCE_TRANSFORMER_IMPORT_ATTEMPTED = True
+    try:
+        from sentence_transformers import SentenceTransformer as _SentenceTransformer  # type: ignore
+    except ImportError:
+        _SENTENCE_TRANSFORMER_CLASS = None
+    else:
+        _SENTENCE_TRANSFORMER_CLASS = _SentenceTransformer
+    return _SENTENCE_TRANSFORMER_CLASS
 
 
 def get_embedding_provider_status(
@@ -166,7 +178,8 @@ def _embed_text_with_openai(*, text: str, model: str) -> list[float] | None:
 
 
 def _embed_text_with_local_model(*, text: str, model: str) -> list[float] | None:
-    if SentenceTransformer is None:
+    sentence_transformer_cls = _get_sentence_transformer_class()
+    if sentence_transformer_cls is None:
         logger.warning("Local embedding request skipped because sentence-transformers is missing model=%s", model)
         return None
     encoder = _load_local_embedding_model(model)
@@ -290,7 +303,7 @@ def _get_ollama_status(model: str) -> dict[str, object]:
 
 
 def _get_local_embedding_status(model: str) -> dict[str, object]:
-    if SentenceTransformer is None:
+    if _get_sentence_transformer_class() is None:
         return {
             "provider": "local",
             "model": model,
@@ -312,6 +325,7 @@ def _get_local_embedding_status(model: str) -> dict[str, object]:
 
 @lru_cache(maxsize=4)
 def _load_local_embedding_model(model: str):
-    if SentenceTransformer is None:
+    sentence_transformer_cls = _get_sentence_transformer_class()
+    if sentence_transformer_cls is None:
         raise AIProviderError("sentence-transformers is not installed.")
-    return SentenceTransformer(model)
+    return sentence_transformer_cls(model)

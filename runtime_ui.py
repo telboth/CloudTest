@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import time
 from collections.abc import Mapping
 from typing import Any
 
@@ -33,6 +34,27 @@ EMBEDDING_MODEL_OPTIONS = {
         "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
     ],
 }
+
+
+def _sqlite_vec_lock_active() -> bool:
+    explicit = getattr(settings, "sqlite_vec_lock_active", None)
+    if explicit is not None:
+        return bool(explicit)
+    return bool(getattr(settings, "database_is_sqlite", False) and getattr(settings, "sqlite_vec_enabled", False))
+
+
+def _sqlite_vec_embedding_provider() -> str:
+    provider = str(getattr(settings, "sqlite_vec_embedding_provider", "openai") or "openai").strip().casefold()
+    if provider not in {"openai", "local"}:
+        provider = "openai"
+    return provider
+
+
+def _sqlite_vec_embedding_model(provider: str) -> str:
+    provider = provider if provider in {"openai", "local"} else "openai"
+    default_model = settings.local_embedding_model if provider == "local" else settings.embedding_model
+    configured_model = str(getattr(settings, "sqlite_vec_embedding_model", default_model) or default_model).strip()
+    return configured_model or default_model
 
 
 def truthy(value: str | None, default: bool = False) -> bool:
@@ -76,6 +98,9 @@ def selected_ai_model() -> str:
 
 
 def selected_embedding_provider() -> str:
+    if _sqlite_vec_lock_active():
+        return _sqlite_vec_embedding_provider()
+
     env_default = str(
         config_value(
             "EMBEDDING_PROVIDER",
@@ -91,6 +116,12 @@ def selected_embedding_provider() -> str:
 
 
 def selected_embedding_model(provider: str | None = None) -> str:
+    if _sqlite_vec_lock_active():
+        resolved_provider = (provider or selected_embedding_provider()).strip().casefold()
+        if resolved_provider not in {"openai", "local"}:
+            resolved_provider = "openai"
+        return _sqlite_vec_embedding_model(resolved_provider)
+
     resolved_provider = (provider or selected_embedding_provider()).strip().casefold()
     if resolved_provider not in {"openai", "local"}:
         resolved_provider = "openai"
@@ -154,6 +185,11 @@ def render_ai_and_embedding_sidebar_settings(*, prefix: str) -> None:
 
         st.divider()
         st.caption("Embedding")
+        sqlite_vec_locked = _sqlite_vec_lock_active()
+        if sqlite_vec_locked:
+            st.info(
+                "SQLite+sqlite-vec er aktiv: embedding-leverandør og modell er låst for konsistent indeks."
+            )
         st.selectbox(
             "Embedding-leverandør",
             options=EMBEDDING_PROVIDER_OPTIONS,
@@ -162,6 +198,7 @@ def render_ai_and_embedding_sidebar_settings(*, prefix: str) -> None:
             else 0,
             key="global_embedding_provider",
             help="Bestemmer hvordan semantisk vektorsøk kjøres.",
+            disabled=sqlite_vec_locked,
         )
 
         selected_provider = selected_embedding_provider()
@@ -176,12 +213,14 @@ def render_ai_and_embedding_sidebar_settings(*, prefix: str) -> None:
                 else 0,
                 key="global_embedding_model",
                 help="Modellen brukes for vektorsøk og lignende-bug-søk.",
+                disabled=sqlite_vec_locked,
             )
         else:
             st.text_input(
                 "Embedding-modell",
                 value=resolved_embedding_model,
                 key="global_embedding_model",
+                disabled=sqlite_vec_locked,
             )
 
         run_embedding_status_check = st.toggle(
@@ -216,59 +255,97 @@ def _format_health_status(status: str) -> tuple[str, str]:
     return icon, label
 
 
-def render_system_and_ops_sidebar(*, jobs: list[dict[str, Any]]) -> None:
+def _get_cached_ready_health(*, max_age_seconds: int = 45) -> dict[str, Any] | None:
+    payload = st.session_state.get("_system_health_payload")
+    captured_at = float(st.session_state.get("_system_health_captured_at", 0.0) or 0.0)
+    if not isinstance(payload, dict):
+        return None
+    if (time.time() - captured_at) > max(1, int(max_age_seconds)):
+        return None
+    return payload
+
+
+def _refresh_ready_health() -> tuple[dict[str, Any] | None, str | None]:
+    try:
+        payload = get_ready_health()
+    except Exception as exc:
+        return None, f"Kunne ikke hente systemstatus: {exc.__class__.__name__}: {exc}"
+    st.session_state["_system_health_payload"] = payload
+    st.session_state["_system_health_captured_at"] = time.time()
+    return payload, None
+
+
+def render_system_and_ops_sidebar(*, jobs: list[dict[str, Any]], telemetry: dict[str, float] | None = None) -> None:
     with st.sidebar.expander("System og drift", expanded=False):
-        try:
-            ready = get_ready_health()
-        except Exception as exc:
-            st.error(f"Kunne ikke hente systemstatus: {exc.__class__.__name__}: {exc}")
-            return
+        h1, h2 = st.columns([1.2, 1])
+        refresh_clicked = h1.button(
+            "Hent health-status",
+            key="sidebar_health_refresh",
+            use_container_width=True,
+            help="Kjører runtime health-sjekker nå. Dette kan ta noen sekunder.",
+        )
+        auto_mode = h2.toggle(
+            "Auto",
+            key="sidebar_health_auto",
+            value=False,
+            help="Når aktiv, hentes health-status automatisk når cache har utløpt.",
+        )
 
-        overall_status = str(ready.get("status") or "unknown")
-        icon, label = _format_health_status(overall_status)
-        st.write(f"Totalstatus: {icon} {label}")
+        ready = _get_cached_ready_health()
+        if refresh_clicked or (auto_mode and ready is None):
+            refreshed, error = _refresh_ready_health()
+            if error:
+                st.error(error)
+            elif isinstance(refreshed, dict):
+                ready = refreshed
 
-        checks = ready.get("checks") or {}
-        if isinstance(checks, dict):
-            check_labels = {
-                "config": "Konfigurasjon",
-                "database": "Database",
-                "ai_text": "AI-tekst",
-                "embeddings": "Embeddings",
-                "search": "Søk",
-                "entra": "Entra",
-            }
-            for key in ("config", "database", "ai_text", "embeddings", "search", "entra"):
-                payload = checks.get(key)
-                if not isinstance(payload, dict):
-                    continue
-                c_icon, c_label = _format_health_status(str(payload.get("status") or "unknown"))
-                st.write(f"{c_icon} {check_labels.get(key, key)}: {c_label}")
-                detail = str(payload.get("detail") or "").strip()
-                if detail:
-                    st.caption(detail)
+        if isinstance(ready, dict):
+            overall_status = str(ready.get("status") or "unknown")
+            icon, label = _format_health_status(overall_status)
+            st.write(f"Totalstatus: {icon} {label}")
 
-                if key == "config":
-                    nested = payload.get("checks")
-                    if isinstance(nested, dict):
-                        for nested_name, nested_payload in nested.items():
-                            if not isinstance(nested_payload, dict):
-                                continue
-                            n_icon, n_label = _format_health_status(str(nested_payload.get("status") or "unknown"))
-                            n_detail = str(nested_payload.get("detail") or "").strip()
-                            st.write(f"  {n_icon} {nested_name}: {n_label}")
-                            if n_detail:
-                                st.caption(f"  {n_detail}")
+            checks = ready.get("checks") or {}
+            if isinstance(checks, dict):
+                check_labels = {
+                    "config": "Konfigurasjon",
+                    "database": "Database",
+                    "ai_text": "AI-tekst",
+                    "embeddings": "Embeddings",
+                    "search": "Søk",
+                }
+                for key in ("config", "database", "ai_text", "embeddings", "search"):
+                    payload = checks.get(key)
+                    if not isinstance(payload, dict):
+                        continue
+                    c_icon, c_label = _format_health_status(str(payload.get("status") or "unknown"))
+                    st.write(f"{c_icon} {check_labels.get(key, key)}: {c_label}")
+                    detail = str(payload.get("detail") or "").strip()
+                    if detail:
+                        st.caption(detail)
 
-                if key == "search":
-                    telemetry = payload.get("telemetry")
-                    if isinstance(telemetry, dict):
-                        st.caption(
-                            "Søk: "
-                            f"queries={int(float(telemetry.get('total_queries', 0.0)))} | "
-                            f"avg_latency_ms={round(float(telemetry.get('avg_latency_ms', 0.0)), 1)} | "
-                            f"fallback_rate={round(float(telemetry.get('fallback_rate', 0.0)) * 100, 1)}%"
-                        )
+                    if key == "config":
+                        nested = payload.get("checks")
+                        if isinstance(nested, dict):
+                            for nested_name, nested_payload in nested.items():
+                                if not isinstance(nested_payload, dict):
+                                    continue
+                                n_icon, n_label = _format_health_status(str(nested_payload.get("status") or "unknown"))
+                                n_detail = str(nested_payload.get("detail") or "").strip()
+                                st.write(f"  {n_icon} {nested_name}: {n_label}")
+                                if n_detail:
+                                    st.caption(f"  {n_detail}")
+
+                    if key == "search":
+                        telemetry = payload.get("telemetry")
+                        if isinstance(telemetry, dict):
+                            st.caption(
+                                "Søk: "
+                                f"queries={int(float(telemetry.get('total_queries', 0.0)))} | "
+                                f"avg_latency_ms={round(float(telemetry.get('avg_latency_ms', 0.0)), 1)} | "
+                                f"fallback_rate={round(float(telemetry.get('fallback_rate', 0.0)) * 100, 1)}%"
+                            )
+        else:
+            st.caption("Health-status er ikke lastet ennå. Trykk «Hent health-status» ved behov.")
 
         st.divider()
         st.caption("Siste bakgrunnsjobber")
@@ -303,6 +380,20 @@ def render_system_and_ops_sidebar(*, jobs: list[dict[str, Any]]) -> None:
             st.write(line)
             if created:
                 st.caption(created)
+            queue_latency_ms = job.get("queue_latency_ms")
+            run_duration_ms = job.get("run_duration_ms")
+            if queue_latency_ms is not None or run_duration_ms is not None:
+                st.caption(
+                    f"kø={round(float(queue_latency_ms or 0.0), 1)} ms | kjøring={round(float(run_duration_ms or 0.0), 1)} ms"
+                )
             error_text = str(job.get("error") or "").strip()
             if error_text and str(job.get("status") or "") == "failed":
                 st.caption(error_text)
+
+        if isinstance(telemetry, dict) and telemetry:
+            st.divider()
+            st.caption("Ytelse (runtime)")
+            t1, t2, t3 = st.columns(3)
+            t1.metric("Søk snitt (ms)", round(float(telemetry.get("search_avg_ms", 0.0) or 0.0), 1))
+            t2.metric("AI venting snitt (ms)", round(float(telemetry.get("ai_wait_avg_ms", 0.0) or 0.0), 1))
+            t3.metric("Admin side (ms)", round(float(telemetry.get("page_admin_ms", 0.0) or 0.0), 1))
