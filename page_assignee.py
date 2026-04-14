@@ -57,6 +57,7 @@ def render_assignee_page(user: dict[str, str], **deps: Any) -> None:
     _prefetch_bug_details = deps["_prefetch_bug_details"]
     _sla_brief_label = deps["_sla_brief_label"]
     _render_bug_export_sidebar = deps["_render_bug_export_sidebar"]
+    _sidebar_should_render = deps["_sidebar_should_render"]
 
     st.markdown(
         """
@@ -75,12 +76,22 @@ def render_assignee_page(user: dict[str, str], **deps: Any) -> None:
         unsafe_allow_html=True,
     )
     bugs = _prepare_page_bug_list(user=user, prefix="assignee")
-    _render_sidebar_work_queue_filters(prefix="assignee", mode="assignee")
+    show_queue_filters = _sidebar_should_render("assignee", "Arbeidskø-filtre")
+    if show_queue_filters:
+        _render_sidebar_work_queue_filters(prefix="assignee", mode="assignee")
+    else:
+        st.session_state["assignee_queue_status"] = "all"
+        st.session_state["assignee_queue_critical_only"] = False
+        st.session_state["assignee_queue_negative_only"] = False
+        st.session_state["assignee_queue_stale_only"] = False
     bugs = _apply_sidebar_work_queue_filters(bugs, prefix="assignee", mode="assignee")
     bugs = _prioritize_assignee_bugs(bugs, user_email=user["email"])
-    _render_bug_export_sidebar(prefix="assignee", bugs=bugs)
-    _render_assignee_sidebar_queue_summary(bugs)
-    _render_assignee_sidebar_duplicates(user, bugs)
+    if _sidebar_should_render("assignee", "Eksport"):
+        _render_bug_export_sidebar(prefix="assignee", bugs=bugs)
+    if _sidebar_should_render("assignee", "Arbeidskø"):
+        _render_assignee_sidebar_queue_summary(bugs)
+    if _sidebar_should_render("assignee", "Mulige duplikater"):
+        _render_assignee_sidebar_duplicates(user, bugs)
     assignable_emails = _build_assignable_emails()
     st.caption("Du ser alle bugs. Bugs tildelt deg vises øverst og er merket i listen.")
     render_bug_status_summary(bugs=bugs, title="Assignee-oversikt")

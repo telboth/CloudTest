@@ -3448,6 +3448,81 @@ def _load_bugs_for_user_cached(user: dict[str, str], ttl_seconds: int = 8) -> li
     return _load_bugs_for_user(user)
 
 
+_ADVANCED_SIDEBAR_SECTIONS: dict[str, list[str]] = {
+    "reporter": [
+        "Filtrering",
+        "Lagrede filter",
+        "AI-innstillinger",
+        "System og drift",
+        "Eksport",
+        "TODO",
+    ],
+    "assignee": [
+        "Filtrering",
+        "Lagrede filter",
+        "AI-innstillinger",
+        "System og drift",
+        "Arbeidskø-filtre",
+        "Arbeidskø",
+        "Mulige duplikater",
+        "Eksport",
+        "TODO",
+    ],
+    "admin": [
+        "Filtrering",
+        "Lagrede filter",
+        "AI-innstillinger",
+        "System og drift",
+        "Arbeidskø-filtre",
+        "Admin-filtrering",
+        "Arbeidskø",
+        "Mulige duplikater",
+        "Eksport",
+        "Admin-tilganger",
+        "TODO",
+    ],
+}
+
+
+def _advanced_sidebar_sections(prefix: str) -> list[str]:
+    return list(_ADVANCED_SIDEBAR_SECTIONS.get(prefix, _ADVANCED_SIDEBAR_SECTIONS["reporter"]))
+
+
+def _render_sidebar_advanced_controller(prefix: str) -> None:
+    mode_key = f"{prefix}_advanced_mode"
+    section_key = f"{prefix}_advanced_section"
+    sections = _advanced_sidebar_sections(prefix)
+    selector_options = ["Alle"] + sections
+
+    st.sidebar.toggle(
+        "Avansert modus",
+        key=mode_key,
+        value=bool(st.session_state.get(mode_key, False)),
+        help="Når aktiv vises avanserte sidebarmoduler. Velg én seksjon om gangen for mindre støy.",
+    )
+    if not st.session_state.get(mode_key):
+        st.session_state[section_key] = "Alle"
+        return
+
+    current_value = str(st.session_state.get(section_key, "Alle") or "Alle")
+    if current_value not in selector_options:
+        current_value = "Alle"
+    st.sidebar.selectbox(
+        "Avansert seksjon",
+        options=selector_options,
+        index=selector_options.index(current_value),
+        key=section_key,
+        help="Velg hvilken avansert seksjon som skal vises i sidebaren.",
+    )
+
+
+def _sidebar_should_render(prefix: str, section_name: str) -> bool:
+    if not bool(st.session_state.get(f"{prefix}_advanced_mode", False)):
+        return False
+    selected = str(st.session_state.get(f"{prefix}_advanced_section", "Alle") or "Alle")
+    return selected == "Alle" or selected == section_name
+
+
 def _prepare_page_bug_list(*, user: dict[str, str], prefix: str) -> list[Bug]:
     bugs = _load_bugs_for_user_cached(user)
     search_labels = {
@@ -3456,10 +3531,16 @@ def _prepare_page_bug_list(*, user: dict[str, str], prefix: str) -> list[Bug]:
         "admin": "Søk i bugs (vektorsøk)",
     }
     query = render_sidebar_search(prefix, label=search_labels.get(prefix, "Søk i bugs (vektorsøk)"))
-    render_sidebar_bug_filters(prefix, bugs)
-    _render_saved_filter_views_sidebar(user=user, prefix=prefix)
-    _render_ai_and_embedding_sidebar_settings(prefix=prefix)
-    _render_system_and_ops_sidebar(jobs=_background_jobs_snapshot(), telemetry=_runtime_performance_snapshot())
+    _render_sidebar_advanced_controller(prefix)
+    show_filtering = _sidebar_should_render(prefix, "Filtrering")
+    if show_filtering:
+        render_sidebar_bug_filters(prefix, bugs)
+    if _sidebar_should_render(prefix, "Lagrede filter"):
+        _render_saved_filter_views_sidebar(user=user, prefix=prefix)
+    if _sidebar_should_render(prefix, "AI-innstillinger"):
+        _render_ai_and_embedding_sidebar_settings(prefix=prefix)
+    if _sidebar_should_render(prefix, "System og drift"):
+        _render_system_and_ops_sidebar(jobs=_background_jobs_snapshot(), telemetry=_runtime_performance_snapshot())
 
     candidate_bugs = bugs
     vector_search_active = False
@@ -3493,6 +3574,11 @@ def _prepare_page_bug_list(*, user: dict[str, str], prefix: str) -> list[Bug]:
             _record_runtime_metric(f"search_{prefix}_ms", elapsed_ms)
 
     st.session_state[f"{prefix}_vector_search_active"] = vector_search_active
+    if not show_filtering:
+        st.session_state[f"{prefix}_filter_status_mode"] = "all"
+        st.session_state[f"{prefix}_filter_severity"] = []
+        st.session_state[f"{prefix}_filter_tags"] = []
+        st.session_state[f"{prefix}_sort_mode"] = "Nyeste først"
     filtered_bugs = apply_sidebar_bug_filters(
         bugs=candidate_bugs,
         prefix=prefix,
@@ -4277,15 +4363,20 @@ def main() -> None:
         key="top_page_selector",
         label_visibility="collapsed",
     )
+    selected_prefix = "reporter"
     if selected_page == "Reporter":
         _render_reporter_page(user)
+        selected_prefix = "reporter"
     elif selected_page == "Assignee":
         _render_assignee_page(user)
+        selected_prefix = "assignee"
     else:
         _render_admin_page(user)
+        selected_prefix = "admin"
 
     # Keep TODO as the final sidebar block regardless of active page.
-    _render_todo_sidebar()
+    if _sidebar_should_render(selected_prefix, "TODO"):
+        _render_todo_sidebar()
 
 
 if __name__ == "__main__":

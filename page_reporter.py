@@ -34,6 +34,7 @@ def render_reporter_page(user: dict[str, str], **deps: Any) -> None:
     _prefetch_bug_details = deps["_prefetch_bug_details"]
     _sla_brief_label = deps["_sla_brief_label"]
     _render_bug_export_sidebar = deps["_render_bug_export_sidebar"]
+    _sidebar_should_render = deps["_sidebar_should_render"]
     _reporter_update_text_key = deps["_reporter_update_text_key"]
     normalize_bug_status = deps["normalize_bug_status"]
     _assignee_select_options = deps["_assignee_select_options"]
@@ -361,7 +362,8 @@ def render_reporter_page(user: dict[str, str], **deps: Any) -> None:
                 st.rerun()
 
     bugs = _prepare_page_bug_list(user=user, prefix="reporter")
-    _render_bug_export_sidebar(prefix="reporter", bugs=bugs)
+    if _sidebar_should_render("reporter", "Eksport"):
+        _render_bug_export_sidebar(prefix="reporter", bugs=bugs)
     render_bug_status_summary(bugs=bugs, title="Reporter-oversikt")
     visible_count = render_bug_list_controls(prefix="reporter", total_count=len(bugs), default_visible=5)
     st.caption(f"Viser {min(len(bugs), visible_count)} av {len(bugs)} bugs.")

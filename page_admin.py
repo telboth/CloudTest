@@ -7,6 +7,7 @@ def render_admin_page(user: dict[str, str], **deps: Any) -> None:
     st = deps["st"]
     _prepare_page_bug_list = deps["_prepare_page_bug_list"]
     _sidebar_render_once = deps["_sidebar_render_once"]
+    _sidebar_should_render = deps["_sidebar_should_render"]
     _render_sidebar_work_queue_filters = deps["_render_sidebar_work_queue_filters"]
     _apply_sidebar_work_queue_filters = deps["_apply_sidebar_work_queue_filters"]
     _render_admin_sidebar_advanced_filters = deps["_render_admin_sidebar_advanced_filters"]
@@ -60,19 +61,34 @@ def render_admin_page(user: dict[str, str], **deps: Any) -> None:
     _sla_brief_label = deps["_sla_brief_label"]
 
     bugs = _prepare_page_bug_list(user=user, prefix="admin")
-    if _sidebar_render_once("admin_sidebar_work_queue_filters"):
+    show_queue_filters = _sidebar_should_render("admin", "Arbeidskø-filtre")
+    if show_queue_filters and _sidebar_render_once("admin_sidebar_work_queue_filters"):
         _render_sidebar_work_queue_filters(prefix="admin", mode="admin")
+    elif not show_queue_filters:
+        st.session_state["admin_queue_status"] = "all"
+        st.session_state["admin_queue_critical_only"] = False
+        st.session_state["admin_queue_negative_only"] = False
+        st.session_state["admin_queue_stale_only"] = False
+        st.session_state["admin_queue_unassigned_only"] = False
     bugs = _apply_sidebar_work_queue_filters(bugs, prefix="admin", mode="admin")
-    if _sidebar_render_once("admin_sidebar_advanced_filters"):
+
+    show_admin_advanced_filters = _sidebar_should_render("admin", "Admin-filtrering")
+    if show_admin_advanced_filters and _sidebar_render_once("admin_sidebar_advanced_filters"):
         _render_admin_sidebar_advanced_filters()
+    elif not show_admin_advanced_filters:
+        st.session_state["admin_created_from"] = ""
+        st.session_state["admin_sentiment_filter"] = "all"
+        st.session_state["admin_only_unassigned"] = False
+        st.session_state["admin_reporter_contains"] = ""
+        st.session_state["admin_satisfaction_filter"] = "all"
     bugs = _apply_admin_advanced_filters(bugs)
-    if _sidebar_render_once("admin_sidebar_export"):
+    if _sidebar_should_render("admin", "Eksport") and _sidebar_render_once("admin_sidebar_export"):
         _render_bug_export_sidebar(prefix="admin", bugs=bugs)
-    if _sidebar_render_once("admin_sidebar_queue_summary"):
+    if _sidebar_should_render("admin", "Arbeidskø") and _sidebar_render_once("admin_sidebar_queue_summary"):
         _render_admin_sidebar_queue_summary(bugs)
-    if _sidebar_render_once("admin_sidebar_duplicates"):
+    if _sidebar_should_render("admin", "Mulige duplikater") and _sidebar_render_once("admin_sidebar_duplicates"):
         _render_admin_sidebar_duplicates(user, bugs)
-    if _sidebar_render_once("admin_sidebar_access_management"):
+    if _sidebar_should_render("admin", "Admin-tilganger") and _sidebar_render_once("admin_sidebar_access_management"):
         _render_admin_access_management_sidebar(current_admin_email=user["email"])
     assignable_emails = _build_assignable_emails()
     render_bug_status_summary(bugs=bugs, title="Admin-oversikt")
