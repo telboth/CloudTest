@@ -6,6 +6,7 @@ from typing import Any
 def render_admin_page(user: dict[str, str], **deps: Any) -> None:
     st = deps["st"]
     _prepare_page_bug_list = deps["_prepare_page_bug_list"]
+    _sidebar_render_once = deps["_sidebar_render_once"]
     _render_sidebar_work_queue_filters = deps["_render_sidebar_work_queue_filters"]
     _apply_sidebar_work_queue_filters = deps["_apply_sidebar_work_queue_filters"]
     _render_admin_sidebar_advanced_filters = deps["_render_admin_sidebar_advanced_filters"]
@@ -58,16 +59,21 @@ def render_admin_page(user: dict[str, str], **deps: Any) -> None:
     _prefetch_bug_details = deps["_prefetch_bug_details"]
     _sla_brief_label = deps["_sla_brief_label"]
 
-    st.subheader("Admin")
     bugs = _prepare_page_bug_list(user=user, prefix="admin")
-    _render_sidebar_work_queue_filters(prefix="admin", mode="admin")
+    if _sidebar_render_once("admin_sidebar_work_queue_filters"):
+        _render_sidebar_work_queue_filters(prefix="admin", mode="admin")
     bugs = _apply_sidebar_work_queue_filters(bugs, prefix="admin", mode="admin")
-    _render_admin_sidebar_advanced_filters()
+    if _sidebar_render_once("admin_sidebar_advanced_filters"):
+        _render_admin_sidebar_advanced_filters()
     bugs = _apply_admin_advanced_filters(bugs)
-    _render_bug_export_sidebar(prefix="admin", bugs=bugs)
-    _render_admin_sidebar_queue_summary(bugs)
-    _render_admin_sidebar_duplicates(user, bugs)
-    _render_admin_access_management_sidebar(current_admin_email=user["email"])
+    if _sidebar_render_once("admin_sidebar_export"):
+        _render_bug_export_sidebar(prefix="admin", bugs=bugs)
+    if _sidebar_render_once("admin_sidebar_queue_summary"):
+        _render_admin_sidebar_queue_summary(bugs)
+    if _sidebar_render_once("admin_sidebar_duplicates"):
+        _render_admin_sidebar_duplicates(user, bugs)
+    if _sidebar_render_once("admin_sidebar_access_management"):
+        _render_admin_access_management_sidebar(current_admin_email=user["email"])
     assignable_emails = _build_assignable_emails()
     render_bug_status_summary(bugs=bugs, title="Admin-oversikt")
     _render_admin_dashboard_cards(bugs)

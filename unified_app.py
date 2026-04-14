@@ -136,7 +136,6 @@ from foundation import (
     render_bug_list_controls,
     render_bug_status_summary,
     render_sidebar_bug_filters,
-    render_sidebar_refresh_button,
     render_sidebar_search,
     status_label,
 )
@@ -170,6 +169,7 @@ from runtime_ui import (
     current_search_settings as _current_search_settings,
     render_ai_and_embedding_sidebar_settings as _render_ai_and_embedding_sidebar_settings,
     render_system_and_ops_sidebar as _render_system_and_ops_sidebar,
+    render_todo_sidebar as _render_todo_sidebar,
     selected_ai_model as _selected_ai_model,
 )
 from page_admin import render_admin_page as _render_admin_page_module
@@ -344,6 +344,9 @@ def _apply_pending_assignee_solution_to_note(bug_id: int) -> None:
     existing = str(st.session_state.get(note_key, "") or "").rstrip()
     separator = "\n\n" if existing else ""
     st.session_state[note_key] = f"{existing}{separator}{suggestion}".strip()
+    st.session_state[_assignee_solution_state_key(bug_id, "text")] = ""
+    st.session_state[_assignee_solution_state_key(bug_id, "source")] = ""
+    st.session_state[_assignee_solution_state_key(bug_id, "error")] = ""
     st.session_state[pending_key] = False
 
 
@@ -3446,12 +3449,6 @@ def _load_bugs_for_user_cached(user: dict[str, str], ttl_seconds: int = 8) -> li
 
 
 def _prepare_page_bug_list(*, user: dict[str, str], prefix: str) -> list[Bug]:
-    _render_ai_and_embedding_sidebar_settings(prefix=prefix)
-    _render_system_and_ops_sidebar(jobs=_background_jobs_snapshot(), telemetry=_runtime_performance_snapshot())
-    if render_sidebar_refresh_button(prefix):
-        _clear_bug_cache()
-        st.rerun()
-
     bugs = _load_bugs_for_user_cached(user)
     search_labels = {
         "reporter": "Søk i dine bugs (vektorsøk)",
@@ -3461,6 +3458,8 @@ def _prepare_page_bug_list(*, user: dict[str, str], prefix: str) -> list[Bug]:
     query = render_sidebar_search(prefix, label=search_labels.get(prefix, "Søk i bugs (vektorsøk)"))
     render_sidebar_bug_filters(prefix, bugs)
     _render_saved_filter_views_sidebar(user=user, prefix=prefix)
+    _render_ai_and_embedding_sidebar_settings(prefix=prefix)
+    _render_system_and_ops_sidebar(jobs=_background_jobs_snapshot(), telemetry=_runtime_performance_snapshot())
 
     candidate_bugs = bugs
     vector_search_active = False
@@ -3500,6 +3499,22 @@ def _prepare_page_bug_list(*, user: dict[str, str], prefix: str) -> list[Bug]:
         apply_query_filter=not vector_search_active,
     )
     return filtered_bugs
+
+
+def _sidebar_render_once(key: str) -> bool:
+    """Return True the first time a sidebar block is requested in this rerun."""
+    registry = st.session_state.setdefault("_sidebar_render_once_registry", set())
+    if not isinstance(registry, set):
+        registry = set()
+        st.session_state["_sidebar_render_once_registry"] = registry
+    normalized = str(key or "").strip()
+    if not normalized:
+        return True
+    if normalized in registry:
+        return False
+    registry.add(normalized)
+    st.session_state["_sidebar_render_once_registry"] = registry
+    return True
 
 
 def _severity_priority(severity: str | None) -> int:
@@ -4245,19 +4260,32 @@ def main() -> None:
     if not user:
         return
 
+    # Reset per-rerun sidebar section registry.
+    st.session_state["_sidebar_render_once_registry"] = set()
+
     pages = ["Reporter"]
     if user["role"] in {"assignee", "admin"}:
         pages.append("Assignee")
     if user["role"] == "admin":
         pages.append("Admin")
 
-    page = st.sidebar.radio("Arbeidsflate", pages, index=0)
-    if page == "Reporter":
+    selected_page = st.radio(
+        "Visning",
+        options=pages,
+        index=0,
+        horizontal=True,
+        key="top_page_selector",
+        label_visibility="collapsed",
+    )
+    if selected_page == "Reporter":
         _render_reporter_page(user)
-    elif page == "Assignee":
+    elif selected_page == "Assignee":
         _render_assignee_page(user)
     else:
         _render_admin_page(user)
+
+    # Keep TODO as the final sidebar block regardless of active page.
+    _render_todo_sidebar()
 
 
 if __name__ == "__main__":

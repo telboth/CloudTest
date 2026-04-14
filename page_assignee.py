@@ -58,7 +58,6 @@ def render_assignee_page(user: dict[str, str], **deps: Any) -> None:
     _sla_brief_label = deps["_sla_brief_label"]
     _render_bug_export_sidebar = deps["_render_bug_export_sidebar"]
 
-    st.subheader("Assignee")
     st.markdown(
         """
         <style>
@@ -175,14 +174,10 @@ def render_assignee_page(user: dict[str, str], **deps: Any) -> None:
             if is_resolved:
                 st.info("Denne bugen er løst og kan ikke oppdateres. Sett den tilbake til Åpen for å gjøre endringer.")
 
-            solution_key = _assignee_solution_state_key(bug.id, "text")
             error_key = _assignee_solution_state_key(bug.id, "error")
-            source_key = _assignee_solution_state_key(bug.id, "source")
-            suggestion_text = str(st.session_state.get(solution_key, "") or "").strip()
             suggestion_error = str(st.session_state.get(error_key, "") or "").strip()
-            suggestion_source = str(st.session_state.get(source_key, "") or "").strip()
 
-            a1, a2, a3, a4 = st.columns(4)
+            a1, a2, a3 = st.columns(3)
             with a1:
                 suggest_solution_clicked = st.button(
                     "AI: Foreslå løsning",
@@ -192,14 +187,6 @@ def render_assignee_page(user: dict[str, str], **deps: Any) -> None:
                     disabled=is_resolved,
                 )
             with a2:
-                insert_solution_clicked = st.button(
-                    "Sett inn forslag",
-                    key=f"assignee_insert_solution_{bug.id}",
-                    use_container_width=True,
-                    disabled=(not bool(suggestion_text)) or is_resolved,
-                    help="Legger AI-forslaget inn i arbeidsnotatet.",
-                )
-            with a3:
                 sentiment_clicked = st.button(
                     "Sentiment - analyse",
                     key=f"assignee_sentiment_{bug.id}",
@@ -207,7 +194,7 @@ def render_assignee_page(user: dict[str, str], **deps: Any) -> None:
                     help="Analyserer sentiment i samtalen for denne bugen.",
                     disabled=is_resolved,
                 )
-            with a4:
+            with a3:
                 summarize_clicked = st.button(
                     "AI-Oppsummer bug",
                     key=f"assignee_summarize_{bug.id}",
@@ -218,16 +205,6 @@ def render_assignee_page(user: dict[str, str], **deps: Any) -> None:
 
             if suggestion_error:
                 st.warning(suggestion_error)
-            if suggestion_text:
-                st.caption(f"Løsningsforslag ({suggestion_source or 'AI'})")
-                st.text_area(
-                    "Løsningsforslag",
-                    value=suggestion_text,
-                    key=f"assignee_solution_preview_{bug.id}",
-                    disabled=True,
-                    label_visibility="collapsed",
-                    height=90,
-                )
 
             c1, c2 = st.columns(2)
             with c1:
@@ -318,11 +295,8 @@ def render_assignee_page(user: dict[str, str], **deps: Any) -> None:
                         st.session_state[_assignee_solution_state_key(bug.id, "error")] = ""
                         st.session_state[_assignee_solution_state_key(bug.id, "text")] = str(suggestion or "").strip()
                         st.session_state[_assignee_solution_state_key(bug.id, "source")] = str(source or "ai").strip()
+                        _queue_apply_assignee_solution_to_note(bug.id)
                     st.rerun()
-
-            if insert_solution_clicked:
-                _queue_apply_assignee_solution_to_note(bug.id)
-                st.rerun()
 
             if sentiment_clicked:
                 allowed, throttle_message = _allow_ai_action(f"assignee:sentiment:{bug.id}")

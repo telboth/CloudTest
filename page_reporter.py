@@ -53,7 +53,6 @@ def render_reporter_page(user: dict[str, str], **deps: Any) -> None:
     MAX_ATTACHMENTS_PER_UPLOAD = deps["MAX_ATTACHMENTS_PER_UPLOAD"]
     MAX_ATTACHMENT_BYTES = deps["MAX_ATTACHMENT_BYTES"]
 
-    st.subheader("Reporter")
     _ensure_reporter_state()
     all_bugs_for_similarity = _load_bugs_for_user_cached({"email": user["email"], "role": "admin"})
     assignable_emails = _build_assignable_emails()
