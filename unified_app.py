@@ -72,6 +72,9 @@ def _bootstrap_cloud_test_env_from_secrets() -> None:
         "OPENAI_MODEL": "openai_model",
         "OPENAI_EMBEDDING_MODEL": "openai_embedding_model",
         "CLOUD_TEST_ALLOW_LOCAL_LOGIN": "cloud_test_allow_local_login",
+        "CLOUD_TEST_ENABLE_TEST_LOGIN": "cloud_test_enable_test_login",
+        "CLOUD_TEST_LOCAL_TEST_EMAIL": "cloud_test_local_test_email",
+        "CLOUD_TEST_LOCAL_TEST_PASSWORD": "cloud_test_local_test_password",
     }
     for env_key, app_key in mapping.items():
         if os.getenv(env_key):
@@ -2538,6 +2541,33 @@ def _init_local_data() -> bool:
         run_local_schema_upgrades()
 
     _recover_orphan_background_jobs()
+    enable_test_login = str(_config_value("CLOUD_TEST_ENABLE_TEST_LOGIN", "true")).strip().casefold() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    test_login_email = _normalize_email(_config_value("CLOUD_TEST_LOCAL_TEST_EMAIL", "admin@example.com"))
+    test_login_password = _config_value("CLOUD_TEST_LOCAL_TEST_PASSWORD", "admin123")
+    if enable_test_login and _is_valid_email(test_login_email) and test_login_password:
+        with db_session() as db:
+            test_user = db.get(User, test_login_email)
+            if test_user:
+                test_user.role = "admin"
+                test_user.auth_provider = "local"
+                test_user.password_hash = get_password_hash(test_login_password)
+            else:
+                db.add(
+                    User(
+                        email=test_login_email,
+                        full_name="Local Test Admin",
+                        password_hash=get_password_hash(test_login_password),
+                        role="admin",
+                        auth_provider="local",
+                    )
+                )
+            _commit_with_retry(db, operation="Oppretting av lokal test-innlogging")
+
     if not _allow_local_login():
         return True
 
@@ -2637,6 +2667,10 @@ def _auth_gate() -> bool:
         db_session=db_session,
         verify_password=verify_password,
         user_model=User,
+        local_default_email=_config_value("CLOUD_TEST_LOCAL_TEST_EMAIL", "admin@example.com"),
+        local_default_password=_config_value("CLOUD_TEST_LOCAL_TEST_PASSWORD", "admin123"),
+        enable_test_login=str(_config_value("CLOUD_TEST_ENABLE_TEST_LOGIN", "true")).strip().casefold()
+        in {"1", "true", "yes", "on"},
         logger=logger,
     )
 

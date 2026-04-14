@@ -120,23 +120,70 @@ def _local_login_sidebar(
     db_session: Callable[[], Any],
     verify_password: Callable[[str, str], bool],
     user_model: Any,
+    default_email: str = "",
+    default_password: str = "",
+    enable_test_login: bool = False,
 ) -> None:
-    if not allow_local_login():
+    local_login_allowed = allow_local_login()
+    if not local_login_allowed and not enable_test_login:
         return
+    
+    def _authenticate_local_user(email: str, password: str) -> bool:
+        normalized_email = str(email or "").strip().casefold()
+        with db_session() as db:
+            user = db.get(user_model, normalized_email) if normalized_email else None
+            auth_provider = str(getattr(user, "auth_provider", "") or "").strip().casefold() if user else ""
+            is_local_user = auth_provider == "local"
+            if not user or not is_local_user or not verify_password(password, user.password_hash):
+                st.sidebar.error("Ugyldig e-post eller passord.")
+                return False
+            st.session_state["email"] = user.email
+            st.session_state["role"] = user.role
+            return True
+
+    if enable_test_login:
+        st.sidebar.caption("Test-innlogging")
+        quick_email = (
+            st.sidebar.text_input(
+                "Test e-post",
+                key="quick_local_login_email",
+                value=(default_email or "").strip(),
+            )
+            .strip()
+            .casefold()
+        )
+        quick_password = st.sidebar.text_input(
+            "Test passord",
+            type="password",
+            key="quick_local_login_password",
+            value=default_password or "",
+        )
+        if st.sidebar.button("Logg inn (test)", use_container_width=True, key="quick_local_login_btn"):
+            if _authenticate_local_user(quick_email, quick_password):
+                st.rerun()
+
+    if not local_login_allowed:
+        return
+
     with st.sidebar.expander("Lokal innlogging", expanded=False):
-        email = st.text_input("E-post", key="local_login_email").strip().casefold()
-        password = st.text_input("Passord", type="password", key="local_login_password")
+        email = (
+            st.text_input(
+                "E-post",
+                key="local_login_email",
+                value=(default_email or "").strip(),
+            )
+            .strip()
+            .casefold()
+        )
+        password = st.text_input(
+            "Passord",
+            type="password",
+            key="local_login_password",
+            value=default_password or "",
+        )
         if st.button("Logg inn lokalt", use_container_width=True, key="local_login_btn"):
-            with db_session() as db:
-                user = db.get(user_model, email) if email else None
-                auth_provider = str(getattr(user, "auth_provider", "") or "").strip().casefold() if user else ""
-                is_local_user = auth_provider == "local"
-                if not user or not is_local_user or not verify_password(password, user.password_hash):
-                    st.error("Ugyldig e-post eller passord.")
-                else:
-                    st.session_state["email"] = user.email
-                    st.session_state["role"] = user.role
-                    st.rerun()
+            if _authenticate_local_user(email, password):
+                st.rerun()
 
 
 def _logout_sidebar(*, logger: Any) -> None:
@@ -160,6 +207,9 @@ def render_auth_gate(
     db_session: Callable[[], Any],
     verify_password: Callable[[str, str], bool],
     user_model: Any,
+    local_default_email: str = "",
+    local_default_password: str = "",
+    enable_test_login: bool = False,
     logger: Any = None,
 ) -> bool:
     st.sidebar.subheader("Innlogging")
@@ -169,6 +219,9 @@ def render_auth_gate(
         db_session=db_session,
         verify_password=verify_password,
         user_model=user_model,
+        default_email=local_default_email,
+        default_password=local_default_password,
+        enable_test_login=enable_test_login,
     )
     user = current_user()
     if not user:
