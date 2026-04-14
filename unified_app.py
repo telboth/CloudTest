@@ -2660,19 +2660,27 @@ def _auth_gate() -> bool:
     if st.session_state.get("_auth_error"):
         st.sidebar.error(str(st.session_state.get("_auth_error")))
         st.session_state.pop("_auth_error", None)
-    return _render_auth_gate(
-        allow_local_login=_allow_local_login,
-        current_user=_current_user,
-        set_user=_set_user,
-        db_session=db_session,
-        verify_password=verify_password,
-        user_model=User,
-        local_default_email=_config_value("CLOUD_TEST_LOCAL_TEST_EMAIL", "admin@example.com"),
-        local_default_password=_config_value("CLOUD_TEST_LOCAL_TEST_PASSWORD", "admin123"),
-        enable_test_login=str(_config_value("CLOUD_TEST_ENABLE_TEST_LOGIN", "true")).strip().casefold()
+    base_kwargs = {
+        "allow_local_login": _allow_local_login,
+        "current_user": _current_user,
+        "set_user": _set_user,
+        "db_session": db_session,
+        "verify_password": verify_password,
+        "user_model": User,
+        "logger": logger,
+    }
+    extended_kwargs = {
+        **base_kwargs,
+        "local_default_email": _config_value("CLOUD_TEST_LOCAL_TEST_EMAIL", "admin@example.com"),
+        "local_default_password": _config_value("CLOUD_TEST_LOCAL_TEST_PASSWORD", "admin123"),
+        "enable_test_login": str(_config_value("CLOUD_TEST_ENABLE_TEST_LOGIN", "true")).strip().casefold()
         in {"1", "true", "yes", "on"},
-        logger=logger,
-    )
+    }
+    try:
+        return _render_auth_gate(**extended_kwargs)
+    except TypeError:
+        logger.warning("auth_ui.render_auth_gate has legacy signature; retrying without test-login kwargs")
+        return _render_auth_gate(**base_kwargs)
 
 
 def _load_bugs_for_user(user: dict[str, str]) -> list[Bug]:
