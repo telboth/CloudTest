@@ -36,6 +36,7 @@ def render_assignee_page(user: dict[str, str], **deps: Any) -> None:
     MAX_ATTACHMENTS_PER_UPLOAD = deps["MAX_ATTACHMENTS_PER_UPLOAD"]
     MAX_ATTACHMENT_BYTES = deps["MAX_ATTACHMENT_BYTES"]
     _openai_assignee_solution_suggestion = deps["_openai_assignee_solution_suggestion"]
+    _allow_ai_action = deps["_allow_ai_action"]
     _queue_apply_assignee_solution_to_note = deps["_queue_apply_assignee_solution_to_note"]
     _start_background_job = deps["_start_background_job"]
     _run_bug_sentiment_analysis = deps["_run_bug_sentiment_analysis"]
@@ -54,6 +55,8 @@ def render_assignee_page(user: dict[str, str], **deps: Any) -> None:
     _render_attachments = deps["_render_attachments"]
     _render_bug_history = deps["_render_bug_history"]
     _prefetch_bug_details = deps["_prefetch_bug_details"]
+    _sla_brief_label = deps["_sla_brief_label"]
+    _render_bug_export_sidebar = deps["_render_bug_export_sidebar"]
 
     st.subheader("Assignee")
     st.markdown(
@@ -76,6 +79,7 @@ def render_assignee_page(user: dict[str, str], **deps: Any) -> None:
     _render_sidebar_work_queue_filters(prefix="assignee", mode="assignee")
     bugs = _apply_sidebar_work_queue_filters(bugs, prefix="assignee", mode="assignee")
     bugs = _prioritize_assignee_bugs(bugs, user_email=user["email"])
+    _render_bug_export_sidebar(prefix="assignee", bugs=bugs)
     _render_assignee_sidebar_queue_summary(bugs)
     _render_assignee_sidebar_duplicates(user, bugs)
     assignable_emails = _build_assignable_emails()
@@ -157,7 +161,7 @@ def render_assignee_page(user: dict[str, str], **deps: Any) -> None:
                 f"Rapportør: {bug.reporter_id} | Tildelt: {bug.assignee_id or '-'} | "
                 f"Rapportert dato: {display_reporting_date} | Status: {status_label(bug.status)} | "
                 f"Alvorlighetsgrad: {bug.severity} | Kategori: {bug.category or '-'} | Miljø: {bug.environment or '-'} | "
-                f"Tagger: {bug.tags or '-'} | Sentiment: {bug.sentiment_label or '-'}"
+                f"Tagger: {bug.tags or '-'} | Sentiment: {bug.sentiment_label or '-'} | {_sla_brief_label(bug)}"
             )
             if bug.reporter_satisfaction:
                 st.caption(f"Rapportør-tilfredshet: {bug.reporter_satisfaction}")
@@ -300,47 +304,59 @@ def render_assignee_page(user: dict[str, str], **deps: Any) -> None:
                 )
 
             if suggest_solution_clicked:
-                with st.spinner("Genererer løsningsforslag..."):
-                    suggestion, source, error = _openai_assignee_solution_suggestion(bug)
-                if error:
-                    st.session_state[_assignee_solution_state_key(bug.id, "error")] = str(error)
-                    st.session_state[_assignee_solution_state_key(bug.id, "text")] = ""
-                    st.session_state[_assignee_solution_state_key(bug.id, "source")] = ""
+                allowed, throttle_message = _allow_ai_action(f"assignee:solution:{bug.id}")
+                if not allowed:
+                    st.warning(str(throttle_message or "AI-knappen er midlertidig sperret. Prøv igjen om litt."))
                 else:
-                    st.session_state[_assignee_solution_state_key(bug.id, "error")] = ""
-                    st.session_state[_assignee_solution_state_key(bug.id, "text")] = str(suggestion or "").strip()
-                    st.session_state[_assignee_solution_state_key(bug.id, "source")] = str(source or "ai").strip()
-                st.rerun()
+                    with st.spinner("Genererer løsningsforslag..."):
+                        suggestion, source, error = _openai_assignee_solution_suggestion(bug)
+                    if error:
+                        st.session_state[_assignee_solution_state_key(bug.id, "error")] = str(error)
+                        st.session_state[_assignee_solution_state_key(bug.id, "text")] = ""
+                        st.session_state[_assignee_solution_state_key(bug.id, "source")] = ""
+                    else:
+                        st.session_state[_assignee_solution_state_key(bug.id, "error")] = ""
+                        st.session_state[_assignee_solution_state_key(bug.id, "text")] = str(suggestion or "").strip()
+                        st.session_state[_assignee_solution_state_key(bug.id, "source")] = str(source or "ai").strip()
+                    st.rerun()
 
             if insert_solution_clicked:
                 _queue_apply_assignee_solution_to_note(bug.id)
                 st.rerun()
 
             if sentiment_clicked:
-                job_id = _start_background_job(
-                    prefix="assignee",
-                    bug_id=bug.id,
-                    job_key="sentiment",
-                    job_label="Sentimentanalyse",
-                    target=lambda: {"error": _run_bug_sentiment_analysis(user, bug.id)},
-                )
-                quick_state = _wait_for_background_job_completion(job_id, timeout_seconds=6, poll_seconds=0.5)
-                if quick_state == "timeout":
-                    st.info("Sentimentanalyse fortsetter i bakgrunnen.")
-                st.rerun()
+                allowed, throttle_message = _allow_ai_action(f"assignee:sentiment:{bug.id}")
+                if not allowed:
+                    st.warning(str(throttle_message or "AI-knappen er midlertidig sperret. Prøv igjen om litt."))
+                else:
+                    job_id = _start_background_job(
+                        prefix="assignee",
+                        bug_id=bug.id,
+                        job_key="sentiment",
+                        job_label="Sentimentanalyse",
+                        target=lambda: {"error": _run_bug_sentiment_analysis(user, bug.id)},
+                    )
+                    quick_state = _wait_for_background_job_completion(job_id, timeout_seconds=6, poll_seconds=0.5)
+                    if quick_state == "timeout":
+                        st.info("Sentimentanalyse fortsetter i bakgrunnen.")
+                    st.rerun()
 
             if summarize_clicked:
-                job_id = _start_background_job(
-                    prefix="assignee",
-                    bug_id=bug.id,
-                    job_key="summarize",
-                    job_label="Bugoppsummering",
-                    target=lambda: {"error": _run_bug_summary(user, bug.id)},
-                )
-                quick_state = _wait_for_background_job_completion(job_id, timeout_seconds=6, poll_seconds=0.5)
-                if quick_state == "timeout":
-                    st.info("Bugoppsummering fortsetter i bakgrunnen.")
-                st.rerun()
+                allowed, throttle_message = _allow_ai_action(f"assignee:summarize:{bug.id}")
+                if not allowed:
+                    st.warning(str(throttle_message or "AI-knappen er midlertidig sperret. Prøv igjen om litt."))
+                else:
+                    job_id = _start_background_job(
+                        prefix="assignee",
+                        bug_id=bug.id,
+                        job_key="summarize",
+                        job_label="Bugoppsummering",
+                        target=lambda: {"error": _run_bug_summary(user, bug.id)},
+                    )
+                    quick_state = _wait_for_background_job_completion(job_id, timeout_seconds=6, poll_seconds=0.5)
+                    if quick_state == "timeout":
+                        st.info("Bugoppsummering fortsetter i bakgrunnen.")
+                    st.rerun()
 
             action_b1, action_b2, action_b3 = st.columns(3)
             with action_b1:

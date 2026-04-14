@@ -16,7 +16,10 @@ def render_admin_page(user: dict[str, str], **deps: Any) -> None:
     _build_assignable_emails = deps["_build_assignable_emails"]
     render_bug_status_summary = deps["render_bug_status_summary"]
     _render_admin_dashboard_cards = deps["_render_admin_dashboard_cards"]
+    _render_admin_trend_report = deps["_render_admin_trend_report"]
+    _render_admin_audit_log_panel = deps["_render_admin_audit_log_panel"]
     _render_admin_operations_panel = deps["_render_admin_operations_panel"]
+    _render_bug_export_sidebar = deps["_render_bug_export_sidebar"]
     render_bug_list_controls = deps["render_bug_list_controls"]
     _sentiment_symbol = deps["_sentiment_symbol"]
     build_bug_expander_title = deps["build_bug_expander_title"]
@@ -28,6 +31,7 @@ def render_admin_page(user: dict[str, str], **deps: Any) -> None:
     format_datetime_display = deps["format_datetime_display"]
     status_label = deps["status_label"]
     _start_background_job = deps["_start_background_job"]
+    _allow_ai_action = deps["_allow_ai_action"]
     _run_bug_sentiment_analysis = deps["_run_bug_sentiment_analysis"]
     _wait_for_background_job_completion = deps["_wait_for_background_job_completion"]
     _request_delete_confirmation = deps["_request_delete_confirmation"]
@@ -52,6 +56,7 @@ def render_admin_page(user: dict[str, str], **deps: Any) -> None:
     _render_attachments = deps["_render_attachments"]
     _render_bug_history = deps["_render_bug_history"]
     _prefetch_bug_details = deps["_prefetch_bug_details"]
+    _sla_brief_label = deps["_sla_brief_label"]
 
     st.subheader("Admin")
     bugs = _prepare_page_bug_list(user=user, prefix="admin")
@@ -59,12 +64,15 @@ def render_admin_page(user: dict[str, str], **deps: Any) -> None:
     bugs = _apply_sidebar_work_queue_filters(bugs, prefix="admin", mode="admin")
     _render_admin_sidebar_advanced_filters()
     bugs = _apply_admin_advanced_filters(bugs)
+    _render_bug_export_sidebar(prefix="admin", bugs=bugs)
     _render_admin_sidebar_queue_summary(bugs)
     _render_admin_sidebar_duplicates(user, bugs)
     _render_admin_access_management_sidebar(current_admin_email=user["email"])
     assignable_emails = _build_assignable_emails()
     render_bug_status_summary(bugs=bugs, title="Admin-oversikt")
     _render_admin_dashboard_cards(bugs)
+    _render_admin_trend_report(bugs)
+    _render_admin_audit_log_panel()
     _render_admin_operations_panel(user)
 
     if not bugs:
@@ -138,7 +146,7 @@ def render_admin_page(user: dict[str, str], **deps: Any) -> None:
                 f"Rapportør: {bug.reporter_id} | Tildelt: {bug.assignee_id or '-'} | "
                 f"Rapportert dato: {display_reporting_date} | Status: {status_label(bug.status)} | "
                 f"Alvorlighetsgrad: {bug.severity} | Kategori: {bug.category or '-'} | Miljø: {bug.environment or '-'} | "
-                f"Tagger: {bug.tags or '-'} | Sentiment: {bug.sentiment_label or '-'}"
+                f"Tagger: {bug.tags or '-'} | Sentiment: {bug.sentiment_label or '-'} | {_sla_brief_label(bug)}"
             )
             if bug.reporter_satisfaction:
                 st.caption(f"Rapportør-tilfredshet: {bug.reporter_satisfaction}")
@@ -174,17 +182,21 @@ def render_admin_page(user: dict[str, str], **deps: Any) -> None:
                 )
 
             if sentiment_clicked:
-                job_id = _start_background_job(
-                    prefix="admin",
-                    bug_id=bug.id,
-                    job_key="sentiment",
-                    job_label="Sentimentanalyse",
-                    target=lambda: {"error": _run_bug_sentiment_analysis(user, bug.id)},
-                )
-                quick_state = _wait_for_background_job_completion(job_id, timeout_seconds=6, poll_seconds=0.5)
-                if quick_state == "timeout":
-                    st.info("Sentimentanalyse fortsetter i bakgrunnen.")
-                st.rerun()
+                allowed, throttle_message = _allow_ai_action(f"admin:sentiment:{bug.id}")
+                if not allowed:
+                    st.warning(str(throttle_message or "AI-knappen er midlertidig sperret. Prøv igjen om litt."))
+                else:
+                    job_id = _start_background_job(
+                        prefix="admin",
+                        bug_id=bug.id,
+                        job_key="sentiment",
+                        job_label="Sentimentanalyse",
+                        target=lambda: {"error": _run_bug_sentiment_analysis(user, bug.id)},
+                    )
+                    quick_state = _wait_for_background_job_completion(job_id, timeout_seconds=6, poll_seconds=0.5)
+                    if quick_state == "timeout":
+                        st.info("Sentimentanalyse fortsetter i bakgrunnen.")
+                    st.rerun()
 
             if delete_clicked:
                 _request_delete_confirmation(prefix="admin", item_key=f"bug_{bug.id}")
@@ -203,17 +215,21 @@ def render_admin_page(user: dict[str, str], **deps: Any) -> None:
                     st.rerun()
 
             if summarize_clicked:
-                job_id = _start_background_job(
-                    prefix="admin",
-                    bug_id=bug.id,
-                    job_key="summarize",
-                    job_label="Bugoppsummering",
-                    target=lambda: {"error": _run_bug_summary(user, bug.id)},
-                )
-                quick_state = _wait_for_background_job_completion(job_id, timeout_seconds=6, poll_seconds=0.5)
-                if quick_state == "timeout":
-                    st.info("Bugoppsummering fortsetter i bakgrunnen.")
-                st.rerun()
+                allowed, throttle_message = _allow_ai_action(f"admin:summarize:{bug.id}")
+                if not allowed:
+                    st.warning(str(throttle_message or "AI-knappen er midlertidig sperret. Prøv igjen om litt."))
+                else:
+                    job_id = _start_background_job(
+                        prefix="admin",
+                        bug_id=bug.id,
+                        job_key="summarize",
+                        job_label="Bugoppsummering",
+                        target=lambda: {"error": _run_bug_summary(user, bug.id)},
+                    )
+                    quick_state = _wait_for_background_job_completion(job_id, timeout_seconds=6, poll_seconds=0.5)
+                    if quick_state == "timeout":
+                        st.info("Bugoppsummering fortsetter i bakgrunnen.")
+                    st.rerun()
 
             quick_col1, quick_col2 = st.columns(2)
             with quick_col1:

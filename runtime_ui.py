@@ -276,6 +276,11 @@ def _refresh_ready_health() -> tuple[dict[str, Any] | None, str | None]:
 
 
 def render_system_and_ops_sidebar(*, jobs: list[dict[str, Any]], telemetry: dict[str, float] | None = None) -> None:
+    with st.sidebar.expander("TODO", expanded=False):
+        st.write("1. Automatisk varsel når bug opprettes, tildeles, kommenteres eller lukkes (e-post/Teams/Slack).")
+        st.write("2. Koble opp mot DevOPS")
+        st.write("3. Rollebaserte in-app varsler (f.eks. ny bug tildelt meg).")
+
     with st.sidebar.expander("System og drift", expanded=False):
         h1, h2 = st.columns([1.2, 1])
         refresh_clicked = h1.button(

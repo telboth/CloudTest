@@ -5,17 +5,18 @@ import sys
 import json
 import time
 import re
+import csv
 import shutil
 import sqlite3
 import tempfile
 import zipfile
-from io import BytesIO
+from io import BytesIO, StringIO
 from difflib import SequenceMatcher
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from collections.abc import Mapping
-from statistics import mean
+from statistics import mean, median
 from typing import Any, Callable
 from urllib.parse import urlparse
 from uuid import uuid4
@@ -788,6 +789,61 @@ def _render_admin_operations_panel(user: dict[str, str]) -> None:
         )
 
         st.divider()
+        st.caption("SLA-regler (timer fra opprettet til forventet løsning)")
+        sla_rules = _load_sla_hours()
+        s1, s2, s3, s4 = st.columns(4)
+        with s1:
+            sla_critical = st.number_input(
+                "Critical",
+                min_value=1,
+                max_value=24 * 365,
+                value=int(sla_rules.get("critical", _SLA_DEFAULT_HOURS["critical"])),
+                step=1,
+                key="admin_sla_critical",
+            )
+        with s2:
+            sla_high = st.number_input(
+                "High",
+                min_value=1,
+                max_value=24 * 365,
+                value=int(sla_rules.get("high", _SLA_DEFAULT_HOURS["high"])),
+                step=1,
+                key="admin_sla_high",
+            )
+        with s3:
+            sla_medium = st.number_input(
+                "Medium",
+                min_value=1,
+                max_value=24 * 365,
+                value=int(sla_rules.get("medium", _SLA_DEFAULT_HOURS["medium"])),
+                step=1,
+                key="admin_sla_medium",
+            )
+        with s4:
+            sla_low = st.number_input(
+                "Low",
+                min_value=1,
+                max_value=24 * 365,
+                value=int(sla_rules.get("low", _SLA_DEFAULT_HOURS["low"])),
+                step=1,
+                key="admin_sla_low",
+            )
+        if st.button("Lagre SLA-regler", key="admin_sla_save", use_container_width=True):
+            sla_error = _save_sla_hours(
+                {
+                    "critical": int(sla_critical),
+                    "high": int(sla_high),
+                    "medium": int(sla_medium),
+                    "low": int(sla_low),
+                }
+            )
+            if sla_error:
+                st.error(sla_error)
+            else:
+                st.success("SLA-regler lagret.")
+                st.rerun()
+
+        st.divider()
         st.caption("Backup / restore")
         b1, b2 = st.columns(2)
         if b1.button("Lag backup (.zip)", key="admin_backup_build", use_container_width=True):
@@ -980,6 +1036,7 @@ def _ensure_reporter_state() -> None:
         "reporter_ai_input": "",
         "reporter_ai_status": "",
         "reporter_ai_error": "",
+        "reporter_ai_validation_warnings": [],
         "reporter_ai_debug_details": "",
         "reporter_ai_file_extract_summary": "",
         "reporter_similar_results": [],
@@ -989,7 +1046,6 @@ def _ensure_reporter_state() -> None:
         "reporter_typeahead_source": "",
         "reporter_duplicate_exact_id": None,
         "reporter_duplicate_candidates": [],
-        "reporter_confirm_unique_bug": False,
         "reporter_duplicate_checked": False,
         "reporter_form_reset_pending": False,
         "reporter_append_description_pending": "",
@@ -1033,13 +1089,13 @@ def _apply_reporter_form_reset() -> None:
     st.session_state["reporter_create_tags"] = ""
     st.session_state["reporter_ai_debug_details"] = ""
     st.session_state["reporter_ai_file_extract_summary"] = ""
+    st.session_state["reporter_ai_validation_warnings"] = []
     st.session_state["reporter_typeahead_suggestion"] = ""
     st.session_state["reporter_typeahead_error"] = ""
     st.session_state["reporter_typeahead_source"] = ""
     st.session_state["reporter_duplicate_exact_id"] = None
     st.session_state["reporter_duplicate_candidates"] = []
     st.session_state["reporter_duplicate_checked"] = False
-    st.session_state["reporter_confirm_unique_bug"] = False
     st.session_state["reporter_append_description_pending"] = ""
     st.session_state["reporter_uploader_nonce"] = int(st.session_state.get("reporter_uploader_nonce", 0)) + 1
     st.session_state["reporter_ai_uploader_nonce"] = int(st.session_state.get("reporter_ai_uploader_nonce", 0)) + 1
@@ -1070,6 +1126,104 @@ def _parse_email_list(value: str | None) -> list[str]:
         if entry not in unique:
             unique.append(entry)
     return unique
+
+
+def _normalize_ai_choice(value: Any, *, allowed: list[str], default: str) -> tuple[str, bool]:
+    candidate = str(value or "").strip().casefold()
+    if candidate in set(allowed):
+        return candidate, False
+    return default, bool(candidate)
+
+
+def _sanitize_ai_tags(
+    value: Any,
+    *,
+    max_tags: int = 12,
+    max_tag_length: int = 32,
+    max_total_length: int = 240,
+) -> tuple[str, int]:
+    if value is None:
+        return "", 0
+    if isinstance(value, list):
+        raw_parts = [str(item or "") for item in value]
+    else:
+        raw_parts = re.split(r"[,;\n]+", str(value or ""))
+
+    cleaned_tags: list[str] = []
+    seen: set[str] = set()
+    dropped_count = 0
+    for raw in raw_parts:
+        token = str(raw or "").strip()
+        if not token:
+            continue
+        token = token.lstrip("#")
+        token = re.sub(r"[^\w\-./ ]+", "", token, flags=re.UNICODE)
+        token = re.sub(r"\s+", "-", token.strip())
+        token = token.strip("-._")
+        if len(token) < 2:
+            dropped_count += 1
+            continue
+        if len(token) > max_tag_length:
+            token = token[:max_tag_length].rstrip("-._")
+        if len(token) < 2:
+            dropped_count += 1
+            continue
+        normalized = token.casefold()
+        if normalized in seen:
+            continue
+        tentative = cleaned_tags + [token]
+        if len(", ".join(tentative)) > max_total_length:
+            dropped_count += 1
+            continue
+        seen.add(normalized)
+        cleaned_tags.append(token)
+        if len(cleaned_tags) >= max_tags:
+            dropped_count += max(0, len(raw_parts) - len(cleaned_tags))
+            break
+    return ", ".join(cleaned_tags), dropped_count
+
+
+def _allow_ai_action(
+    action_key: str,
+    *,
+    cooldown_seconds: float = 2.5,
+    max_calls_in_window: int = 3,
+    window_seconds: float = 20.0,
+) -> tuple[bool, str | None]:
+    now = time.time()
+    state = st.session_state.setdefault("_ai_action_limiter", {})
+    raw_timestamps = state.get(action_key, []) if isinstance(state, dict) else []
+    timestamps = []
+    if isinstance(raw_timestamps, list):
+        for value in raw_timestamps:
+            try:
+                ts = float(value)
+            except (TypeError, ValueError):
+                continue
+            if (now - ts) <= max(1.0, float(window_seconds)):
+                timestamps.append(ts)
+
+    if timestamps and (now - timestamps[-1]) < max(0.1, float(cooldown_seconds)):
+        wait_seconds = max(0.1, float(cooldown_seconds) - (now - timestamps[-1]))
+        state[action_key] = timestamps
+        st.session_state["_ai_action_limiter"] = state
+        return (
+            False,
+            f"AI-knappen ble nylig brukt. Vent {wait_seconds:.1f} sek før du prøver igjen.",
+        )
+
+    if len(timestamps) >= max(1, int(max_calls_in_window)):
+        state[action_key] = timestamps
+        st.session_state["_ai_action_limiter"] = state
+        return (
+            False,
+            "For mange AI-kall på kort tid. Vent litt og prøv igjen.",
+        )
+
+    timestamps.append(now)
+    state[action_key] = timestamps
+    st.session_state["_ai_action_limiter"] = state
+    return True, None
 
 
 def _build_assignable_emails() -> list[str]:
@@ -1345,43 +1499,86 @@ def _run_bug_summary(user: dict[str, str], bug_id: int) -> str | None:
     return None
 
 
-def _apply_reporter_ai_draft(payload: dict, *, allowed_assignees: set[str] | None = None) -> None:
-    st.session_state["reporter_create_title"] = str(payload.get("title", "") or "").strip()
-    st.session_state["reporter_create_description"] = str(payload.get("description", "") or "").strip()
+def _sanitize_reporter_ai_payload(
+    payload: dict,
+    *,
+    allowed_assignees: set[str] | None = None,
+) -> tuple[dict[str, str], list[str]]:
+    warnings: list[str] = []
+    title = str(payload.get("title", "") or "").strip()[:255]
+    description = str(payload.get("description", "") or "").strip()
+    severity, severity_corrected = _normalize_ai_choice(
+        payload.get("severity"),
+        allowed=SEVERITY_OPTIONS,
+        default="medium",
+    )
+    category, category_corrected = _normalize_ai_choice(
+        payload.get("category"),
+        allowed=CATEGORY_OPTIONS,
+        default="software",
+    )
+    if severity_corrected:
+        warnings.append("AI-forslag for alvorlighetsgrad var ugyldig og ble satt til 'medium'.")
+    if category_corrected:
+        warnings.append("AI-forslag for kategori var ugyldig og ble satt til 'software'.")
 
-    severity = str(payload.get("severity", "") or "").strip().casefold()
-    category = str(payload.get("category", "") or "").strip().casefold()
     assignee_email = _normalize_email(str(payload.get("assignee_email", "") or ""))
-    notify_value = payload.get("notify_emails", "")
-    environment = str(payload.get("environment", "") or "").strip()
-    tags_value = payload.get("tags", "")
-
-    if severity in SEVERITY_OPTIONS:
-        st.session_state["reporter_create_severity"] = severity
-    if category in CATEGORY_OPTIONS:
-        st.session_state["reporter_create_category"] = category
     normalized_allowed_assignees = {
         _normalize_email(item)
         for item in (allowed_assignees or set())
         if _normalize_email(item)
     }
-    if assignee_email and (
-        not normalized_allowed_assignees or assignee_email in normalized_allowed_assignees
-    ):
-        st.session_state["reporter_create_assignee"] = assignee_email
-    else:
-        st.session_state["reporter_create_assignee"] = ""
+    if assignee_email:
+        if not _is_valid_email(assignee_email):
+            warnings.append("AI-forslag for tildelt bruker var ikke en gyldig e-post og ble fjernet.")
+            assignee_email = ""
+        elif not normalized_allowed_assignees:
+            warnings.append("AI-forslag for tildelt bruker kunne ikke valideres mot systemet og ble fjernet.")
+            assignee_email = ""
+        elif assignee_email not in normalized_allowed_assignees:
+            warnings.append("AI-forslag for tildelt bruker finnes ikke i systemet; feltet ble tømt.")
+            assignee_email = ""
 
+    notify_value = payload.get("notify_emails", "")
     if isinstance(notify_value, list):
-        st.session_state["reporter_create_notify_emails"] = ", ".join(_parse_email_list(", ".join(str(x) for x in notify_value)))
+        parsed_notify = _parse_email_list(", ".join(str(item) for item in notify_value))
     else:
-        st.session_state["reporter_create_notify_emails"] = ", ".join(_parse_email_list(str(notify_value)))
+        parsed_notify = _parse_email_list(str(notify_value))
+    valid_notify = [entry for entry in parsed_notify if _is_valid_email(entry)]
+    if len(valid_notify) != len(parsed_notify):
+        warnings.append("Noen AI-forslåtte varslingsadresser var ugyldige og ble fjernet.")
 
-    st.session_state["reporter_create_environment"] = environment
-    if isinstance(tags_value, list):
-        st.session_state["reporter_create_tags"] = ", ".join(str(x).strip() for x in tags_value if str(x).strip())
-    else:
-        st.session_state["reporter_create_tags"] = str(tags_value or "").strip()
+    tags_value = payload.get("tags", "")
+    sanitized_tags, dropped_count = _sanitize_ai_tags(tags_value)
+    if dropped_count:
+        warnings.append("Noen AI-forslåtte tagger ble normalisert eller fjernet.")
+
+    return (
+        {
+            "title": title,
+            "description": description,
+            "severity": severity,
+            "category": category,
+            "assignee": assignee_email,
+            "notify_emails": ", ".join(valid_notify),
+            "environment": str(payload.get("environment", "") or "").strip(),
+            "tags": sanitized_tags,
+        },
+        warnings,
+    )
+
+
+def _apply_reporter_ai_draft(payload: dict, *, allowed_assignees: set[str] | None = None) -> list[str]:
+    sanitized, warnings = _sanitize_reporter_ai_payload(payload, allowed_assignees=allowed_assignees)
+    st.session_state["reporter_create_title"] = sanitized["title"]
+    st.session_state["reporter_create_description"] = sanitized["description"]
+    st.session_state["reporter_create_severity"] = sanitized["severity"]
+    st.session_state["reporter_create_category"] = sanitized["category"]
+    st.session_state["reporter_create_assignee"] = sanitized["assignee"]
+    st.session_state["reporter_create_notify_emails"] = sanitized["notify_emails"]
+    st.session_state["reporter_create_environment"] = sanitized["environment"]
+    st.session_state["reporter_create_tags"] = sanitized["tags"]
+    return warnings
 
 
 def _find_similar_bugs(query_text: str, bugs: list[Bug], *, limit: int = 5) -> list[tuple[float, Bug]]:
@@ -1906,6 +2103,11 @@ def _render_admin_dashboard_cards(bugs: list[Bug]) -> None:
     stale_count = sum(1 for bug in bugs if _is_stale_bug(bug))
     critical_aging_count = sum(1 for bug in bugs if _is_critical_aging_bug(bug))
     feedback_count = sum(1 for bug in bugs if str(bug.reporter_satisfaction or "").strip())
+    sla_breach_count = sum(
+        1
+        for bug in bugs
+        if normalize_bug_status(bug.status) != "resolved" and bool(_bug_sla_snapshot(bug).get("overdue"))
+    )
 
     st.caption("Admin-dashboard")
     c1, c2, c3, c4 = st.columns(4)
@@ -1919,6 +2121,7 @@ def _render_admin_dashboard_cards(bugs: list[Bug]) -> None:
     c6.metric("Inaktive 7+ dager", stale_count)
     c7.metric("Kritisk aldring", critical_aging_count)
     c8.metric("Med tilbakemelding", feedback_count)
+    st.caption(f"SLA-brudd (åpne): {sla_breach_count}")
 
     stale_bugs = sorted(
         [bug for bug in bugs if _is_stale_bug(bug)],
@@ -1939,11 +2142,24 @@ def _validate_reporter_create_input(*, assignable_emails: list[str]) -> str | No
     description = str(st.session_state.get("reporter_create_description", "")).strip()
     assignee = _normalize_email(str(st.session_state.get("reporter_create_assignee", "")))
     notify_emails = _parse_email_list(str(st.session_state.get("reporter_create_notify_emails", "")))
+    severity = str(st.session_state.get("reporter_create_severity", "")).strip().casefold()
+    category = str(st.session_state.get("reporter_create_category", "")).strip().casefold()
+    raw_tags = str(st.session_state.get("reporter_create_tags", "") or "").strip()
 
     if len(title) < 3:
         return "Tittel må være minst 3 tegn."
     if len(description) < 10:
         return "Beskrivelse må være minst 10 tegn."
+    if severity not in set(SEVERITY_OPTIONS):
+        return "Alvorlighetsgrad må være en gyldig verdi."
+    if category not in set(CATEGORY_OPTIONS):
+        return "Kategori må være en gyldig verdi."
+    if raw_tags:
+        sanitized_tags, _ = _sanitize_ai_tags(raw_tags)
+        if not sanitized_tags:
+            return "Tagger inneholder ingen gyldige verdier."
+        if len(sanitized_tags) > 255:
+            return "Tagger er for langt. Reduser antall eller lengde på tagger."
     if assignee and assignee not in set(assignable_emails):
         return "Tildelt bruker må velges fra listen over tildelbare brukere."
     invalid_notify = [entry for entry in notify_emails if not _is_valid_email(entry)]
@@ -2072,6 +2288,465 @@ def _runtime_meta_set(db, key: str, value: str) -> None:
         row.value = str(value)
 
 
+_SLA_DEFAULT_HOURS: dict[str, int] = {
+    "critical": 8,
+    "high": 24,
+    "medium": 72,
+    "low": 168,
+}
+
+
+def _truthy(value: str | None) -> bool:
+    return str(value or "").strip().casefold() in {"1", "true", "yes", "on"}
+
+
+def _load_sla_hours(*, force_refresh: bool = False) -> dict[str, int]:
+    cache_key = "_sla_hours_cache"
+    cached = st.session_state.get(cache_key)
+    if not force_refresh and isinstance(cached, dict):
+        normalized_cached = {
+            severity: int(cached.get(severity, default))
+            for severity, default in _SLA_DEFAULT_HOURS.items()
+        }
+        return normalized_cached
+
+    defaults = dict(_SLA_DEFAULT_HOURS)
+    try:
+        with db_session() as db:
+            for severity, default_hours in _SLA_DEFAULT_HOURS.items():
+                raw = _runtime_meta_get(db, f"sla.hours.{severity}", str(default_hours))
+                try:
+                    parsed = int(str(raw).strip())
+                except (TypeError, ValueError):
+                    parsed = default_hours
+                defaults[severity] = max(1, min(24 * 365, parsed))
+    except Exception:
+        defaults = dict(_SLA_DEFAULT_HOURS)
+    st.session_state[cache_key] = dict(defaults)
+    return defaults
+
+
+def _save_sla_hours(new_values: Mapping[str, Any]) -> str | None:
+    normalized: dict[str, int] = {}
+    for severity, default_hours in _SLA_DEFAULT_HOURS.items():
+        raw = new_values.get(severity, default_hours)
+        try:
+            parsed = int(raw)
+        except (TypeError, ValueError):
+            parsed = default_hours
+        normalized[severity] = max(1, min(24 * 365, parsed))
+    try:
+        with db_session() as db:
+            for severity, hours in normalized.items():
+                _runtime_meta_set(db, f"sla.hours.{severity}", str(hours))
+            _commit_with_retry(db, operation="Lagring av SLA-regler")
+    except RuntimeError as exc:
+        return str(exc)
+    except Exception as exc:
+        return format_user_error("Kunne ikke lagre SLA-regler", exc, fallback="Prøv igjen.")
+    st.session_state["_sla_hours_cache"] = dict(normalized)
+    return None
+
+
+def _bug_sla_snapshot(bug: Bug) -> dict[str, Any]:
+    severity = str(getattr(bug, "severity", "") or "").strip().casefold()
+    if severity not in _SLA_DEFAULT_HOURS:
+        severity = "medium"
+    sla_hours = _load_sla_hours()
+    hours = int(sla_hours.get(severity, _SLA_DEFAULT_HOURS["medium"]))
+
+    created_at = bug.created_at
+    if created_at is None:
+        return {"severity": severity, "hours": hours, "due_at": None, "overdue": False, "remaining_hours": None}
+    if created_at.tzinfo is None:
+        created_at = created_at.replace(tzinfo=timezone.utc)
+    due_at = created_at + timedelta(hours=hours)
+
+    is_resolved = normalize_bug_status(str(bug.status or "")) == "resolved"
+    if is_resolved:
+        return {"severity": severity, "hours": hours, "due_at": due_at, "overdue": False, "remaining_hours": None}
+
+    now = datetime.now(timezone.utc)
+    remaining_hours = (due_at - now).total_seconds() / 3600.0
+    overdue = remaining_hours < 0
+    return {
+        "severity": severity,
+        "hours": hours,
+        "due_at": due_at,
+        "overdue": overdue,
+        "remaining_hours": remaining_hours,
+    }
+
+
+def _sla_brief_label(bug: Bug) -> str:
+    snapshot = _bug_sla_snapshot(bug)
+    due_at = snapshot.get("due_at")
+    if not isinstance(due_at, datetime):
+        return "SLA: -"
+    is_resolved = normalize_bug_status(str(bug.status or "")) == "resolved"
+    if is_resolved:
+        return f"SLA: {format_datetime_display(due_at)}"
+    if bool(snapshot.get("overdue")):
+        overdue_hours = abs(float(snapshot.get("remaining_hours") or 0.0))
+        return f"SLA: BRUDD ({round(overdue_hours, 1)} t over)"
+    remaining = float(snapshot.get("remaining_hours") or 0.0)
+    return f"SLA: {round(max(0.0, remaining), 1)} t igjen"
+
+
+def _filter_view_storage_key(*, user_email: str, prefix: str) -> str:
+    return f"filters.views.{_normalize_email(user_email)}.{str(prefix).strip().casefold()}"
+
+
+def _filter_state_keys(prefix: str) -> list[str]:
+    keys = [
+        f"{prefix}_search_query",
+        f"{prefix}_filter_status_mode",
+        f"{prefix}_filter_severity",
+        f"{prefix}_filter_tags",
+        f"{prefix}_sort_mode",
+        f"{prefix}_queue_status",
+        f"{prefix}_queue_critical_only",
+        f"{prefix}_queue_negative_only",
+        f"{prefix}_queue_stale_only",
+        f"{prefix}_queue_unassigned_only",
+        f"{prefix}_visible_count",
+    ]
+    if prefix == "admin":
+        keys.extend(
+            [
+                "admin_created_from",
+                "admin_sentiment_filter",
+                "admin_only_unassigned",
+                "admin_reporter_contains",
+                "admin_satisfaction_filter",
+            ]
+        )
+    return keys
+
+
+def _capture_filter_state(prefix: str) -> dict[str, Any]:
+    captured: dict[str, Any] = {}
+    for key in _filter_state_keys(prefix):
+        value = st.session_state.get(key)
+        if isinstance(value, (str, int, float, bool)):
+            captured[key] = value
+        elif isinstance(value, list):
+            captured[key] = list(value)
+    return captured
+
+
+def _apply_filter_state(state: Mapping[str, Any]) -> None:
+    for key, value in state.items():
+        if isinstance(value, list):
+            st.session_state[key] = list(value)
+        else:
+            st.session_state[key] = value
+
+
+def _load_filter_views(*, user_email: str, prefix: str) -> dict[str, dict[str, Any]]:
+    storage_key = _filter_view_storage_key(user_email=user_email, prefix=prefix)
+    try:
+        with db_session() as db:
+            raw = _runtime_meta_get(db, storage_key, "{}")
+    except Exception:
+        return {}
+    try:
+        payload = json.loads(raw)
+    except (TypeError, ValueError):
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    sanitized: dict[str, dict[str, Any]] = {}
+    for name, state in payload.items():
+        if not isinstance(name, str) or not isinstance(state, dict):
+            continue
+        state_map = {str(k): v for k, v in state.items() if isinstance(k, str)}
+        sanitized[name] = state_map
+    return sanitized
+
+
+def _save_filter_views(*, user_email: str, prefix: str, views: Mapping[str, Mapping[str, Any]]) -> str | None:
+    storage_key = _filter_view_storage_key(user_email=user_email, prefix=prefix)
+    serializable: dict[str, dict[str, Any]] = {}
+    for name, state in views.items():
+        if not isinstance(name, str) or not name.strip() or not isinstance(state, Mapping):
+            continue
+        serializable[name.strip()] = {str(k): v for k, v in state.items() if isinstance(k, str)}
+    try:
+        with db_session() as db:
+            _runtime_meta_set(db, storage_key, json.dumps(serializable, ensure_ascii=False))
+            _commit_with_retry(db, operation="Lagring av filtervisning")
+    except RuntimeError as exc:
+        return str(exc)
+    except Exception as exc:
+        return format_user_error("Kunne ikke lagre filtervisning", exc, fallback="Prøv igjen.")
+    return None
+
+
+def _render_saved_filter_views_sidebar(*, user: dict[str, str], prefix: str) -> None:
+    with st.sidebar.expander("Lagrede filter", expanded=False):
+        views = _load_filter_views(user_email=user["email"], prefix=prefix)
+        names = sorted(views.keys())
+        if names:
+            selected = st.selectbox(
+                "Velg visning",
+                options=names,
+                key=f"{prefix}_saved_filter_selected",
+                help="Last inn en lagret filtervisning for denne siden.",
+            )
+            load_col, delete_col = st.columns(2)
+            with load_col:
+                if st.button("Last inn", key=f"{prefix}_saved_filter_load", use_container_width=True):
+                    state = views.get(selected, {})
+                    if isinstance(state, dict):
+                        _apply_filter_state(state)
+                        st.rerun()
+            with delete_col:
+                if st.button("Slett", key=f"{prefix}_saved_filter_delete", use_container_width=True):
+                    remaining = {name: value for name, value in views.items() if name != selected}
+                    error = _save_filter_views(user_email=user["email"], prefix=prefix, views=remaining)
+                    if error:
+                        st.error(error)
+                    else:
+                        st.success("Filtervisning slettet.")
+                        st.rerun()
+        else:
+            st.caption("Ingen lagrede filtervisninger ennå.")
+
+        new_name = st.text_input(
+            "Nytt navn",
+            key=f"{prefix}_saved_filter_name",
+            placeholder="F.eks. Mine kritiske åpne",
+        )
+        if st.button("Lagre nåværende filter", key=f"{prefix}_saved_filter_save", use_container_width=True):
+            trimmed = str(new_name or "").strip()
+            if len(trimmed) < 2:
+                st.warning("Oppgi et navn med minst 2 tegn.")
+            else:
+                updated = dict(views)
+                updated[trimmed] = _capture_filter_state(prefix)
+                error = _save_filter_views(user_email=user["email"], prefix=prefix, views=updated)
+                if error:
+                    st.error(error)
+                else:
+                    st.success(f"Filtervisning lagret: {trimmed}")
+                    st.rerun()
+
+
+def _bugs_to_export_rows(bugs: list[Bug]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for bug in bugs:
+        sla = _bug_sla_snapshot(bug)
+        rows.append(
+            {
+                "id": int(bug.id),
+                "title": str(bug.title or ""),
+                "status": normalize_bug_status(str(bug.status or "")),
+                "severity": str(bug.severity or ""),
+                "category": str(bug.category or ""),
+                "reporter": str(bug.reporter_id or ""),
+                "assignee": str(bug.assignee_id or ""),
+                "created_at": format_datetime_display(bug.created_at),
+                "updated_at": format_datetime_display(bug.updated_at),
+                "closed_at": format_datetime_display(bug.closed_at),
+                "sla_due_at": format_datetime_display(sla.get("due_at")),
+                "sla_overdue": "yes" if bool(sla.get("overdue")) else "no",
+                "tags": str(bug.tags or ""),
+                "environment": str(bug.environment or ""),
+            }
+        )
+    return rows
+
+
+def _build_bug_export_csv_bytes(bugs: list[Bug]) -> bytes:
+    rows = _bugs_to_export_rows(bugs)
+    if not rows:
+        rows = [{"id": "", "title": "", "status": ""}]
+    fieldnames = list(rows[0].keys())
+    output = StringIO()
+    writer = csv.DictWriter(output, fieldnames=fieldnames)
+    writer.writeheader()
+    for row in rows:
+        writer.writerow(row)
+    return output.getvalue().encode("utf-8")
+
+
+def _build_bug_export_excel_bytes(bugs: list[Bug]) -> bytes | None:
+    try:
+        from openpyxl import Workbook
+    except Exception:
+        return None
+
+    rows = _bugs_to_export_rows(bugs)
+    if not rows:
+        rows = [{"id": "", "title": "", "status": ""}]
+    fieldnames = list(rows[0].keys())
+
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "bugs"
+    sheet.append(fieldnames)
+    for row in rows:
+        sheet.append([row.get(name, "") for name in fieldnames])
+
+    blob = BytesIO()
+    workbook.save(blob)
+    return blob.getvalue()
+
+
+def _render_bug_export_sidebar(*, prefix: str, bugs: list[Bug]) -> None:
+    with st.sidebar.expander("Eksport", expanded=False):
+        st.caption(f"Rader i gjeldende visning: {len(bugs)}")
+        csv_bytes = _build_bug_export_csv_bytes(bugs)
+        st.download_button(
+            "Last ned CSV",
+            data=csv_bytes,
+            file_name=f"bugs_{prefix}_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.csv",
+            mime="text/csv",
+            key=f"{prefix}_export_csv",
+            use_container_width=True,
+        )
+        excel_bytes = _build_bug_export_excel_bytes(bugs)
+        if excel_bytes:
+            st.download_button(
+                "Last ned Excel",
+                data=excel_bytes,
+                file_name=f"bugs_{prefix}_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key=f"{prefix}_export_excel",
+                use_container_width=True,
+            )
+        else:
+            st.caption("Excel-eksport er ikke tilgjengelig i dette miljøet (mangler openpyxl).")
+
+
+def _start_of_week(value: datetime) -> date:
+    current = value
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=timezone.utc)
+    day = current.date()
+    return day - timedelta(days=day.weekday())
+
+
+def _render_admin_trend_report(bugs: list[Bug]) -> None:
+    with st.expander("Rapporter og trender", expanded=False):
+        if not bugs:
+            st.caption("Ingen data å vise.")
+            return
+
+        weekly_opened: dict[date, int] = {}
+        weekly_resolved: dict[date, int] = {}
+        resolution_hours: list[float] = []
+
+        for bug in bugs:
+            if isinstance(bug.created_at, datetime):
+                open_week = _start_of_week(bug.created_at)
+                weekly_opened[open_week] = int(weekly_opened.get(open_week, 0)) + 1
+            if isinstance(bug.closed_at, datetime):
+                resolved_week = _start_of_week(bug.closed_at)
+                weekly_resolved[resolved_week] = int(weekly_resolved.get(resolved_week, 0)) + 1
+            if isinstance(bug.created_at, datetime) and isinstance(bug.closed_at, datetime):
+                created_at = bug.created_at if bug.created_at.tzinfo else bug.created_at.replace(tzinfo=timezone.utc)
+                closed_at = bug.closed_at if bug.closed_at.tzinfo else bug.closed_at.replace(tzinfo=timezone.utc)
+                duration_h = max(0.0, (closed_at - created_at).total_seconds() / 3600.0)
+                resolution_hours.append(duration_h)
+
+        all_weeks = sorted(set(weekly_opened.keys()) | set(weekly_resolved.keys()))
+        if not all_weeks:
+            st.caption("Ingen trenddata tilgjengelig ennå.")
+            return
+        all_weeks = all_weeks[-12:]
+
+        trend_rows = []
+        for week in all_weeks:
+            label = f"{week.isoformat()}"
+            trend_rows.append(
+                {
+                    "uke": label,
+                    "åpnet": int(weekly_opened.get(week, 0)),
+                    "løst": int(weekly_resolved.get(week, 0)),
+                }
+            )
+
+        st.caption("Åpnet/løst per uke (siste 12 uker)")
+        st.dataframe(trend_rows, use_container_width=True, hide_index=True)
+        st.line_chart(
+            {
+                "Åpnet": [row["åpnet"] for row in trend_rows],
+                "Løst": [row["løst"] for row in trend_rows],
+            },
+            use_container_width=True,
+        )
+
+        resolved_count = len(resolution_hours)
+        median_hours = median(resolution_hours) if resolution_hours else 0.0
+        st.caption(
+            f"Løsningstid: median {round(float(median_hours), 1)} timer "
+            f"({resolved_count} løste bugs i valgt datasett)."
+        )
+
+
+def _load_admin_audit_rows(*, limit: int = 150, actor_contains: str = "", action_filter: str = "all") -> list[dict[str, Any]]:
+    normalized_actor = str(actor_contains or "").strip().casefold()
+    normalized_action = str(action_filter or "all").strip().casefold()
+    rows_out: list[dict[str, Any]] = []
+    with db_session() as db:
+        query = (
+            select(BugHistory, Bug.title, Bug.status)
+            .join(Bug, Bug.id == BugHistory.bug_id, isouter=True)
+            .order_by(BugHistory.created_at.desc(), BugHistory.id.desc())
+            .limit(max(10, int(limit)))
+        )
+        results = db.execute(query).all()
+    for history, bug_title, bug_status in results:
+        actor = str(history.actor_email or "")
+        action = str(history.action or "")
+        if normalized_actor and normalized_actor not in actor.casefold():
+            continue
+        if normalized_action != "all" and normalized_action != action.casefold():
+            continue
+        rows_out.append(
+            {
+                "tid": format_datetime_display(history.created_at),
+                "bug_id": int(history.bug_id),
+                "tittel": str(bug_title or ""),
+                "handling": action,
+                "aktor": actor,
+                "status": status_label(str(bug_status or "")),
+                "detaljer": str(history.details or "")[:180],
+            }
+        )
+    return rows_out
+
+
+def _render_admin_audit_log_panel() -> None:
+    with st.expander("Audit-logg", expanded=False):
+        left, right, third = st.columns([1.2, 1.2, 1])
+        with left:
+            actor_contains = st.text_input(
+                "Aktor inneholder",
+                key="admin_audit_actor_contains",
+                placeholder="f.eks. thomas.elboth",
+            )
+        with right:
+            action_filter = st.selectbox(
+                "Handling",
+                options=["all", "created", "updated", "comment_added", "status_changed", "soft_deleted", "restored"],
+                key="admin_audit_action_filter",
+                format_func=lambda value: "Alle" if value == "all" else str(value),
+            )
+        with third:
+            limit = st.selectbox("Antall", options=[50, 100, 150, 250], index=1, key="admin_audit_limit")
+
+        rows = _load_admin_audit_rows(
+            limit=int(limit),
+            actor_contains=str(actor_contains or ""),
+            action_filter=str(action_filter or "all"),
+        )
+        if not rows:
+            st.caption("Ingen audit-hendelser for valgte filtre.")
+            return
+        st.dataframe(rows, use_container_width=True, hide_index=True)
 def _policy_roles(policy_key: str, default_roles: set[str]) -> set[str]:
     try:
         with db_session() as db:
@@ -2785,6 +3460,7 @@ def _prepare_page_bug_list(*, user: dict[str, str], prefix: str) -> list[Bug]:
     }
     query = render_sidebar_search(prefix, label=search_labels.get(prefix, "Søk i bugs (vektorsøk)"))
     render_sidebar_bug_filters(prefix, bugs)
+    _render_saved_filter_views_sidebar(user=user, prefix=prefix)
 
     candidate_bugs = bugs
     vector_search_active = False
@@ -2818,11 +3494,12 @@ def _prepare_page_bug_list(*, user: dict[str, str], prefix: str) -> list[Bug]:
             _record_runtime_metric(f"search_{prefix}_ms", elapsed_ms)
 
     st.session_state[f"{prefix}_vector_search_active"] = vector_search_active
-    return apply_sidebar_bug_filters(
+    filtered_bugs = apply_sidebar_bug_filters(
         bugs=candidate_bugs,
         prefix=prefix,
         apply_query_filter=not vector_search_active,
     )
+    return filtered_bugs
 
 
 def _severity_priority(severity: str | None) -> int:

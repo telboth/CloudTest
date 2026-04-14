@@ -12,6 +12,7 @@ def render_reporter_page(user: dict[str, str], **deps: Any) -> None:
     _extract_text_from_uploaded_files = deps["_extract_text_from_uploaded_files"]
     _openai_reporter_draft = deps["_openai_reporter_draft"]
     _apply_reporter_ai_draft = deps["_apply_reporter_ai_draft"]
+    _allow_ai_action = deps["_allow_ai_action"]
     _build_reporter_draft_query = deps["_build_reporter_draft_query"]
     _find_similar_bugs = deps["_find_similar_bugs"]
     _reset_reporter_form_state = deps["_reset_reporter_form_state"]
@@ -31,6 +32,8 @@ def render_reporter_page(user: dict[str, str], **deps: Any) -> None:
     _render_bug_thread = deps["_render_bug_thread"]
     _render_bug_history = deps["_render_bug_history"]
     _prefetch_bug_details = deps["_prefetch_bug_details"]
+    _sla_brief_label = deps["_sla_brief_label"]
+    _render_bug_export_sidebar = deps["_render_bug_export_sidebar"]
     _reporter_update_text_key = deps["_reporter_update_text_key"]
     normalize_bug_status = deps["normalize_bug_status"]
     _assignee_select_options = deps["_assignee_select_options"]
@@ -111,31 +114,41 @@ def render_reporter_page(user: dict[str, str], **deps: Any) -> None:
                     st.caption("Ingen AI-detaljer tilgjengelig ennå.")
 
         if ai_clicked:
-            source_text = str(st.session_state.get("reporter_ai_input", "")).strip()
-            extracted_file_text, extraction_messages = _extract_text_from_uploaded_files(list(ai_attachments or []))
-            st.session_state["reporter_ai_file_extract_summary"] = "\n".join(extraction_messages)
-            combined_source_text = "\n\n".join(part for part in [source_text, extracted_file_text] if part).strip()
-            with st.spinner("Genererer AI-utkast..."):
-                payload, error, debug_details = _openai_reporter_draft(combined_source_text)
-            st.session_state["reporter_ai_debug_details"] = json.dumps(
-                {
-                    "model": (debug_details or {}).get("model"),
-                    "prompt_chars": (debug_details or {}).get("prompt_chars"),
-                    "response_chars": (debug_details or {}).get("response_chars"),
-                    "exception": (debug_details or {}).get("exception"),
-                },
-                ensure_ascii=False,
-                indent=2,
-            )
-            if error:
-                st.session_state["reporter_ai_error"] = str(error)
-                st.session_state["reporter_ai_status"] = ""
+            allowed, throttle_message = _allow_ai_action("reporter:ai_fill")
+            if not allowed:
+                st.warning(str(throttle_message or "AI-knappen er midlertidig sperret. Prøv igjen om litt."))
             else:
-                st.session_state["reporter_ai_error"] = ""
-                st.session_state["reporter_ai_status"] = "AI-utkast brukt i skjema."
-                if isinstance(payload, dict):
-                    _apply_reporter_ai_draft(payload, allowed_assignees=set(assignable_emails))
-            st.rerun()
+                source_text = str(st.session_state.get("reporter_ai_input", "")).strip()
+                extracted_file_text, extraction_messages = _extract_text_from_uploaded_files(list(ai_attachments or []))
+                st.session_state["reporter_ai_file_extract_summary"] = "\n".join(extraction_messages)
+                combined_source_text = "\n\n".join(part for part in [source_text, extracted_file_text] if part).strip()
+                with st.spinner("Genererer AI-utkast..."):
+                    payload, error, debug_details = _openai_reporter_draft(combined_source_text)
+                st.session_state["reporter_ai_debug_details"] = json.dumps(
+                    {
+                        "model": (debug_details or {}).get("model"),
+                        "prompt_chars": (debug_details or {}).get("prompt_chars"),
+                        "response_chars": (debug_details or {}).get("response_chars"),
+                        "exception": (debug_details or {}).get("exception"),
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                )
+                if error:
+                    st.session_state["reporter_ai_error"] = str(error)
+                    st.session_state["reporter_ai_status"] = ""
+                    st.session_state["reporter_ai_validation_warnings"] = []
+                else:
+                    st.session_state["reporter_ai_error"] = ""
+                    warnings: list[str] = []
+                    if isinstance(payload, dict):
+                        warnings = _apply_reporter_ai_draft(payload, allowed_assignees=set(assignable_emails))
+                    st.session_state["reporter_ai_validation_warnings"] = warnings
+                    status_message = "AI-utkast brukt i skjema."
+                    if warnings:
+                        status_message += f" ({len(warnings)} felt ble normalisert.)"
+                    st.session_state["reporter_ai_status"] = status_message
+                st.rerun()
 
         if similar_clicked:
             query_text = str(st.session_state.get("reporter_ai_input", "")).strip() or _build_reporter_draft_query()
@@ -150,6 +163,11 @@ def render_reporter_page(user: dict[str, str], **deps: Any) -> None:
             st.error(str(st.session_state.get("reporter_ai_error")))
         if st.session_state.get("reporter_ai_status"):
             st.success(str(st.session_state.get("reporter_ai_status")))
+        ai_validation_warnings = st.session_state.get("reporter_ai_validation_warnings") or []
+        if isinstance(ai_validation_warnings, list):
+            for warning in ai_validation_warnings:
+                if str(warning).strip():
+                    st.warning(str(warning))
 
         similar_results = st.session_state.get("reporter_similar_results") or []
         if similar_results:
@@ -252,17 +270,11 @@ def render_reporter_page(user: dict[str, str], **deps: Any) -> None:
         with c5:
             st.text_input("Tagger (kommaseparert)", key="reporter_create_tags")
 
-        create_col, duplicate_col, unique_col = st.columns([1, 1, 2.2])
+        create_col, duplicate_col = st.columns([1, 1])
         with create_col:
             submitted = st.form_submit_button("Opprett bug", use_container_width=True, key="reporter_create_submit")
         with duplicate_col:
             duplicate_check_clicked = st.form_submit_button("Sjekk duplikater", use_container_width=True)
-        with unique_col:
-            st.checkbox(
-                "Denne bugen er forskjellig fra lignende bugs vist over",
-                key="reporter_confirm_unique_bug",
-                help="Kryss av hvis du har vurdert lignende bugs og fortsatt vil sende inn ny bug.",
-            )
 
     if clear_fields_clicked:
         _reset_reporter_form_state()
@@ -279,11 +291,15 @@ def render_reporter_page(user: dict[str, str], **deps: Any) -> None:
         st.rerun()
 
     if suggest_description_clicked:
-        suggestion, error, source = _request_reporter_typeahead(all_bugs_for_similarity)
-        st.session_state["reporter_typeahead_suggestion"] = suggestion
-        st.session_state["reporter_typeahead_error"] = error
-        st.session_state["reporter_typeahead_source"] = source
-        st.rerun()
+        allowed, throttle_message = _allow_ai_action("reporter:ai_typeahead")
+        if not allowed:
+            st.warning(str(throttle_message or "AI-knappen er midlertidig sperret. Prøv igjen om litt."))
+        else:
+            suggestion, error, source = _request_reporter_typeahead(all_bugs_for_similarity)
+            st.session_state["reporter_typeahead_suggestion"] = suggestion
+            st.session_state["reporter_typeahead_error"] = error
+            st.session_state["reporter_typeahead_source"] = source
+            st.rerun()
 
     if insert_suggestion_clicked:
         suggestion = str(st.session_state.get("reporter_typeahead_suggestion", "")).strip()
@@ -324,8 +340,6 @@ def render_reporter_page(user: dict[str, str], **deps: Any) -> None:
             st.warning(validation_error)
         elif duplicate_exact_id is not None:
             st.warning("Innsending stoppet fordi bugen ser ut som et eksakt duplikat.")
-        elif duplicate_candidates and not bool(st.session_state.get("reporter_confirm_unique_bug", False)):
-            st.warning("Bekreft avkryssingen om at bugen er unik før innsending.")
         else:
             error = _create_bug(
                 user,
@@ -348,6 +362,7 @@ def render_reporter_page(user: dict[str, str], **deps: Any) -> None:
                 st.rerun()
 
     bugs = _prepare_page_bug_list(user=user, prefix="reporter")
+    _render_bug_export_sidebar(prefix="reporter", bugs=bugs)
     render_bug_status_summary(bugs=bugs, title="Reporter-oversikt")
     visible_count = render_bug_list_controls(prefix="reporter", total_count=len(bugs), default_visible=5)
     st.caption(f"Viser {min(len(bugs), visible_count)} av {len(bugs)} bugs.")
@@ -378,7 +393,7 @@ def render_reporter_page(user: dict[str, str], **deps: Any) -> None:
                 f"Rapportert dato: {display_reporting_date} | Status: {status_label(bug.status)} | "
                 f"Alvorlighetsgrad: {bug.severity} | Kategori: {bug.category or '-'} | "
                 f"Miljø: {bug.environment or '-'} | Tagger: {bug.tags or '-'} | "
-                f"Opprettet: {format_datetime_display(bug.created_at)}"
+                f"Opprettet: {format_datetime_display(bug.created_at)} | {_sla_brief_label(bug)}"
             )
             if bug.notify_emails:
                 st.caption(f"Varsling: {bug.notify_emails}")

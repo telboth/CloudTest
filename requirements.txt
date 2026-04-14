@@ -7,6 +7,7 @@ passlib==1.7.4
 openai>=1.0.0,<2.0.0
 requests==2.32.5
 pypdf>=5.0.0
+openpyxl>=3.1.0
 pgvector>=0.3.6
 psycopg[binary]>=3.2.9
 sqlite-vec>=0.1.9
