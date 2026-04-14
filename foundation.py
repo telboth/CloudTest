@@ -11,7 +11,7 @@ import streamlit as st
 SEVERITY_ORDER = {"critical": 4, "high": 3, "medium": 2, "low": 1}
 STATUS_ORDER = {"open": 1, "resolved": 2}
 STATUS_LABELS = {"open": "Åpen", "resolved": "Løst"}
-LOGO_PATH = Path(__file__).resolve().parents[1] / "logo-white.svg"
+LOGO_PATH = Path(__file__).resolve().parent / "logo-white.svg"
 
 
 def normalize_bug_status(value: str | None) -> str:
@@ -67,7 +67,9 @@ def render_sidebar_logo(app_title: str | None = None) -> None:
             text-align:center;
         ">
             <div style="max-width:180px; margin:0 auto;">
-                <img src="data:image/svg+xml;base64,{logo_data}" alt="Logo" style="width:100%; height:auto;" />
+                <a href="https://www.xlent.no" target="_blank" rel="noopener noreferrer" style="display:block;">
+                    <img src="data:image/svg+xml;base64,{logo_data}" alt="Logo" style="width:100%; height:auto;" />
+                </a>
             </div>
         </div>
         """,

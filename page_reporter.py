@@ -134,7 +134,7 @@ def render_reporter_page(user: dict[str, str], **deps: Any) -> None:
                 st.session_state["reporter_ai_error"] = ""
                 st.session_state["reporter_ai_status"] = "AI-utkast brukt i skjema."
                 if isinstance(payload, dict):
-                    _apply_reporter_ai_draft(payload)
+                    _apply_reporter_ai_draft(payload, allowed_assignees=set(assignable_emails))
             st.rerun()
 
         if similar_clicked:
@@ -168,7 +168,11 @@ def render_reporter_page(user: dict[str, str], **deps: Any) -> None:
     submitted = False
 
     with st.form("create_bug_form"):
-        st.text_input("Tittel", key="reporter_create_title")
+        st.text_input(
+            "Tittel",
+            key="reporter_create_title",
+            help="Kort oppsummering av problemet, for eksempel hva som feiler og hvor.",
+        )
         uploader_key = f"reporter_new_attachments_{int(st.session_state.get('reporter_uploader_nonce', 0))}"
         st.markdown(
             f"""
@@ -182,7 +186,12 @@ def render_reporter_page(user: dict[str, str], **deps: Any) -> None:
         )
         desc_col, upload_col = st.columns([1.9, 1.1])
         with desc_col:
-            st.text_area("Beskrivelse", key="reporter_create_description", height=180)
+            st.text_area(
+                "Beskrivelse",
+                key="reporter_create_description",
+                height=180,
+                help="Beskriv hva som skjedde, hvordan feilen kan gjenskapes, og forventet resultat.",
+            )
         with upload_col:
             new_attachments = st.file_uploader(
                 "Vedlegg",
@@ -208,7 +217,7 @@ def render_reporter_page(user: dict[str, str], **deps: Any) -> None:
         with action_col_1:
             find_similar_clicked = st.form_submit_button("Finn lignende bugs", use_container_width=True)
         with action_col_2:
-            suggest_description_clicked = st.form_submit_button("Foreslå fortsettelse", use_container_width=True)
+            suggest_description_clicked = st.form_submit_button("AI-Foreslå fortsettelse", use_container_width=True)
         with action_col_3:
             insert_suggestion_clicked = st.form_submit_button(
                 "Sett inn forslag",

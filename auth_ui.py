@@ -228,7 +228,7 @@ def render_auth_gate(
         if allow_local_login():
             st.info("Innlogging kreves. Bruk sidebaren for Microsoft eller lokal innlogging.")
         else:
-            st.info("Innlogging kreves. Bruk sidebaren for Microsoft-innlogging.")
+            st.info("Innlogging kreves. Bruk sidebaren for Microsoft-innlogging. - Eller bruk default test-innlogging")
         return False
     st.sidebar.success(f"Innlogget: {user['email']}")
     _logout_sidebar(logger=logger)

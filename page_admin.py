@@ -166,7 +166,7 @@ def render_admin_page(user: dict[str, str], **deps: Any) -> None:
                 )
             with a3:
                 summarize_clicked = st.button(
-                    "Oppsummer bug",
+                    "AI-Oppsummer bug",
                     key=f"admin_summarize_{bug.id}",
                     use_container_width=True,
                     help="Genererer en kort AI-oppsummering av bug og samtale.",

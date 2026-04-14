@@ -3,6 +3,7 @@ import math
 import re
 from collections.abc import Iterable
 from datetime import datetime, timezone
+from difflib import SequenceMatcher
 from threading import Lock
 from time import perf_counter
 
@@ -716,11 +717,10 @@ def _keyword_score(query: str, bug: Bug, search_text: str) -> float:
     if not query_tokens:
         return 0.0
 
-    title_hits = sum(1 for token in query_tokens if token in lower_title)
-    text_hits = sum(1 for token in query_tokens if token in lower_text)
-    token_count = float(len(query_tokens))
-    title_coverage = title_hits / token_count
-    text_coverage = text_hits / token_count
+    title_tokens = set(_tokenize_query(lower_title))
+    text_tokens = set(_tokenize_query(lower_text))
+    title_coverage = _fuzzy_token_coverage(query_tokens, title_tokens)
+    text_coverage = _fuzzy_token_coverage(query_tokens, text_tokens)
 
     phrase_title = 1.0 if lower_query and lower_query in lower_title else 0.0
     phrase_text = 1.0 if lower_query and lower_query in lower_text else 0.0
@@ -732,6 +732,39 @@ def _keyword_score(query: str, bug: Bug, search_text: str) -> float:
         + (0.08 * phrase_text)
     )
     return max(0.0, min(1.0, score))
+
+
+def _fuzzy_token_coverage(query_tokens: list[str], candidate_tokens: set[str]) -> float:
+    if not query_tokens or not candidate_tokens:
+        return 0.0
+
+    matched_weight = 0.0
+    for token in query_tokens:
+        if token in candidate_tokens:
+            matched_weight += 1.0
+            continue
+        # Fuzzy fallback for minor typos like repeated/omitted characters.
+        if len(token) < 4:
+            continue
+        best_ratio = 0.0
+        for candidate in candidate_tokens:
+            if not candidate:
+                continue
+            if candidate[0] != token[0]:
+                continue
+            if abs(len(candidate) - len(token)) > 8:
+                continue
+            ratio = SequenceMatcher(None, token, candidate).ratio()
+            if len(candidate) > len(token):
+                ratio = max(ratio, SequenceMatcher(None, token, candidate[: len(token)]).ratio())
+            if ratio > best_ratio:
+                best_ratio = ratio
+            if best_ratio >= 0.92:
+                break
+        if best_ratio >= 0.84:
+            matched_weight += 0.75
+
+    return matched_weight / float(len(query_tokens))
 
 
 def _cosine_similarity(left: Iterable[float], right: Iterable[float]) -> float:
