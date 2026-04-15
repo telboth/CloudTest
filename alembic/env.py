@@ -17,6 +17,7 @@ from app.core.config import settings
 from app.core.database import Base
 import app.models.background_job  # noqa: F401
 import app.models.bug  # noqa: F401
+import app.models.notification  # noqa: F401
 import app.models.user  # noqa: F401
 
 config = context.config

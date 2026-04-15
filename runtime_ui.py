@@ -398,8 +398,13 @@ def render_system_and_ops_sidebar(*, jobs: list[dict[str, Any]], telemetry: dict
             t2.metric("AI venting snitt (ms)", round(float(telemetry.get("ai_wait_avg_ms", 0.0) or 0.0), 1))
             t3.metric("Admin side (ms)", round(float(telemetry.get("page_admin_ms", 0.0) or 0.0), 1))
 
-def render_todo_sidebar() -> None:
+def render_todo_sidebar(*, devops_enabled: bool = False, devops_allowed: bool = False, devops_reason: str = "") -> None:
     with st.sidebar.expander("TODO", expanded=False):
         st.write("1. Automatisk varsel når bug opprettes, tildeles, kommenteres eller lukkes (e-post/Teams/Slack).")
         st.write("2. Koble opp mot DevOPS")
-        st.write("3. Rollebaserte in-app varsler (f.eks. ny bug tildelt meg).")
+        if devops_enabled and devops_allowed:
+            st.caption("DevOps er aktivert for denne sesjonen (Entra-innlogging).")
+        elif devops_enabled and not devops_allowed:
+            st.caption(devops_reason or "DevOps er sperret i denne sesjonen.")
+        else:
+            st.caption("DevOps er avslått i konfigurasjon.")

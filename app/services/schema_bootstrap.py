@@ -76,6 +76,33 @@ def run_local_schema_upgrades() -> None:
     _ensure_ddl(
         "CREATE INDEX IF NOT EXISTS ix_bug_search_index_indexed_at ON bug_search_index(indexed_at)"
     )
+    _ensure_ddl(
+        """
+        CREATE TABLE IF NOT EXISTS in_app_notifications (
+            id INTEGER PRIMARY KEY,
+            recipient_email VARCHAR(255) NOT NULL,
+            event_type VARCHAR(80) NOT NULL,
+            bug_id INTEGER NULL REFERENCES bugs(id) ON DELETE SET NULL,
+            title VARCHAR(255) NOT NULL,
+            message TEXT NOT NULL,
+            payload_json TEXT NULL,
+            dedupe_key VARCHAR(255) NOT NULL,
+            actor_email VARCHAR(255) NULL,
+            is_read INTEGER NOT NULL DEFAULT 0,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            read_at DATETIME NULL
+        )
+        """
+    )
+    _ensure_ddl(
+        "CREATE UNIQUE INDEX IF NOT EXISTS ix_in_app_notifications_dedupe_key ON in_app_notifications(dedupe_key)"
+    )
+    _ensure_ddl(
+        "CREATE INDEX IF NOT EXISTS ix_in_app_notifications_recipient_read_created ON in_app_notifications(recipient_email, is_read, created_at)"
+    )
+    _ensure_ddl(
+        "CREATE INDEX IF NOT EXISTS ix_in_app_notifications_bug_id_created_at ON in_app_notifications(bug_id, created_at)"
+    )
     _ensure_sqlite_vec_table()
 
 

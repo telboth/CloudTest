@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from typing import Any
 
 
@@ -42,6 +43,13 @@ def render_assignee_page(user: dict[str, str], **deps: Any) -> None:
     _run_bug_sentiment_analysis = deps["_run_bug_sentiment_analysis"]
     _wait_for_background_job_completion = deps["_wait_for_background_job_completion"]
     _run_bug_summary = deps["_run_bug_summary"]
+    _send_bug_to_devops = deps["_send_bug_to_devops"]
+    _update_bug_in_devops = deps["_update_bug_in_devops"]
+    _fetch_bug_from_devops = deps["_fetch_bug_from_devops"]
+    _apply_devops_snapshot_to_local_bug = deps["_apply_devops_snapshot_to_local_bug"]
+    _remove_bug_from_devops = deps["_remove_bug_from_devops"]
+    _unlink_bug_from_devops_locally = deps["_unlink_bug_from_devops_locally"]
+    _devops_access_state = deps["_devops_access_state"]
     _request_delete_confirmation = deps["_request_delete_confirmation"]
     _render_delete_confirmation = deps["_render_delete_confirmation"]
     _delete_bug = deps["_delete_bug"]
@@ -341,6 +349,198 @@ def render_assignee_page(user: dict[str, str], **deps: Any) -> None:
                     quick_state = _wait_for_background_job_completion(job_id, timeout_seconds=6, poll_seconds=0.5)
                     if quick_state == "timeout":
                         st.info("Bugoppsummering fortsetter i bakgrunnen.")
+                    st.rerun()
+
+            devops_allowed, devops_reason = _devops_access_state(user)
+            devops_work_item_id = int(bug.ado_work_item_id or 0) if bug.ado_work_item_id else 0
+            devops_work_item_url = str(bug.ado_work_item_url or "").strip()
+            devops_snapshot_key = f"assignee_devops_pull_snapshot_{bug.id}"
+            devops_snapshot = st.session_state.get(devops_snapshot_key)
+            if devops_work_item_id <= 0:
+                st.session_state.pop(devops_snapshot_key, None)
+                devops_snapshot = None
+            devops_changed_fields: list[str] = []
+            if normalize_bug_status(status) != normalize_bug_status(bug.status):
+                devops_changed_fields.append("status")
+            if str(severity or "").strip().casefold() != str(bug.severity or "").strip().casefold():
+                devops_changed_fields.append("severity")
+            if _normalize_email(assignee) != _normalize_email(bug.assignee_id):
+                devops_changed_fields.append("assignee")
+            d1, d2, d3, d4, d5, d6 = st.columns(6)
+            with d1:
+                send_devops_clicked = st.button(
+                    "Send bugen til DevOps",
+                    key=f"assignee_send_devops_{bug.id}",
+                    use_container_width=True,
+                    disabled=(not devops_allowed) or bool(devops_work_item_id),
+                )
+            with d2:
+                update_devops_clicked = st.button(
+                    "Oppdater i DevOps",
+                    key=f"assignee_update_devops_{bug.id}",
+                    use_container_width=True,
+                    disabled=(not devops_allowed) or (not bool(devops_work_item_id)),
+                    help="Oppdaterer DevOps med status, alvorlighetsgrad, tildeling og eventuelt notat.",
+                )
+            with d3:
+                fetch_devops_clicked = st.button(
+                    "Hent fra DevOps",
+                    key=f"assignee_fetch_devops_{bug.id}",
+                    use_container_width=True,
+                    disabled=(not devops_allowed) or (not bool(devops_work_item_id)),
+                    help="Henter siste data fra DevOps og viser forskjeller før du eventuelt oppdaterer lokal bug.",
+                )
+            with d4:
+                if devops_work_item_url:
+                    st.link_button(
+                        "Åpne i DevOps",
+                        url=devops_work_item_url,
+                        use_container_width=True,
+                    )
+                elif devops_work_item_id:
+                    st.caption(f"DevOps-ID: #{devops_work_item_id}")
+            with d5:
+                remove_devops_clicked = st.button(
+                    "Fjerne fra DevOps",
+                    key=f"assignee_remove_devops_{bug.id}",
+                    use_container_width=True,
+                    disabled=(not devops_allowed) or (not bool(devops_work_item_id)),
+                    help="Sletter work item i DevOps og fjerner lokal kobling dersom sletting er verifisert.",
+                )
+            with d6:
+                unlink_devops_local_clicked = st.button(
+                    "Koble fra lokalt",
+                    key=f"assignee_unlink_devops_local_{bug.id}",
+                    use_container_width=True,
+                    disabled=(not devops_allowed) or (not bool(devops_work_item_id)),
+                    help="Fjerner kun koblingen i appen. Work item beholdes i DevOps.",
+                )
+
+            if devops_work_item_id:
+                st.caption(f"Synket mot DevOps work item #{devops_work_item_id}.")
+            elif not devops_allowed:
+                st.caption(f"DevOps: {devops_reason}")
+
+            if send_devops_clicked:
+                devops_error, work_item_url = _send_bug_to_devops(user, bug_id=bug.id)
+                if devops_error:
+                    st.error(devops_error)
+                else:
+                    st.session_state.pop(devops_snapshot_key, None)
+                    if work_item_url:
+                        st.success("Bug sendt til DevOps.")
+                    else:
+                        st.success("Bug sendt til DevOps.")
+                    st.rerun()
+            if update_devops_clicked:
+                devops_error, work_item_url = _update_bug_in_devops(
+                    user,
+                    bug_id=bug.id,
+                    status=status,
+                    severity=severity,
+                    assignee_id=assignee,
+                    tags=tags,
+                    comment_text=note.strip() or None,
+                    changed_fields=devops_changed_fields,
+                )
+                if devops_error:
+                    st.error(devops_error)
+                else:
+                    st.session_state.pop(devops_snapshot_key, None)
+                    if work_item_url:
+                        st.success("Bug oppdatert i DevOps.")
+                    else:
+                        st.success("Bug oppdatert i DevOps.")
+                    st.rerun()
+            if fetch_devops_clicked:
+                devops_error, snapshot = _fetch_bug_from_devops(user, bug_id=bug.id)
+                if devops_error:
+                    st.error(devops_error)
+                else:
+                    st.session_state[devops_snapshot_key] = snapshot
+                    st.success("Hentet siste data fra DevOps.")
+                    st.rerun()
+            if remove_devops_clicked:
+                _request_delete_confirmation(prefix="assignee", item_key=f"devops_remove_{bug.id}")
+                st.rerun()
+            if _render_delete_confirmation(
+                prefix="assignee",
+                item_key=f"devops_remove_{bug.id}",
+                message="Er du sikker på at du vil fjerne denne bugen fra DevOps?",
+            ):
+                devops_error, devops_notice = _remove_bug_from_devops(user, bug_id=bug.id)
+                if devops_error:
+                    st.error(devops_error)
+                else:
+                    st.session_state.pop(devops_snapshot_key, None)
+                    notice_text = str(devops_notice or "").strip()
+                    if "finnes fortsatt i devops" in notice_text.casefold():
+                        st.warning(notice_text)
+                    else:
+                        st.success(notice_text or "Bug fjernet fra DevOps.")
+                    st.rerun()
+            if unlink_devops_local_clicked:
+                _request_delete_confirmation(prefix="assignee", item_key=f"devops_unlink_local_{bug.id}")
+                st.rerun()
+            if _render_delete_confirmation(
+                prefix="assignee",
+                item_key=f"devops_unlink_local_{bug.id}",
+                message="Er du sikker på at du vil koble fra DevOps lokalt (uten sletting i DevOps)?",
+            ):
+                devops_error = _unlink_bug_from_devops_locally(user, bug_id=bug.id)
+                if devops_error:
+                    st.error(devops_error)
+                else:
+                    st.session_state.pop(devops_snapshot_key, None)
+                    st.success("Lokal DevOps-kobling fjernet.")
+                    st.rerun()
+
+            if isinstance(devops_snapshot, dict):
+                pulled_at = str(devops_snapshot.get("pulled_at") or "").strip()
+                pulled_caption = pulled_at if pulled_at else "-"
+                changes = devops_snapshot.get("changes")
+                if not isinstance(changes, list):
+                    changes = []
+                st.caption(f"DevOps-snapshot hentet: {pulled_caption}")
+                if changes:
+                    st.info(f"Fant {len(changes)} forskjell(er) mellom lokal bug og DevOps.")
+                    for idx, change in enumerate(changes, start=1):
+                        field_label = str(change.get("field") or f"Felt {idx}")
+                        local_preview = re.sub(r"\s+", " ", str(change.get("local") or "-")).strip()
+                        devops_preview = re.sub(r"\s+", " ", str(change.get("devops") or "-")).strip()
+                        if len(local_preview) > 120:
+                            local_preview = local_preview[:117] + "..."
+                        if len(devops_preview) > 120:
+                            devops_preview = devops_preview[:117] + "..."
+                        st.caption(f"{field_label}: lokal='{local_preview}' | DevOps='{devops_preview}'")
+                else:
+                    st.caption("Ingen forskjeller funnet mellom lokal bug og DevOps.")
+
+                sync_c1, sync_c2 = st.columns(2)
+                with sync_c1:
+                    apply_snapshot_clicked = st.button(
+                        "Oppdater lokal bug",
+                        key=f"assignee_apply_devops_snapshot_{bug.id}",
+                        use_container_width=True,
+                        disabled=(not devops_allowed),
+                    )
+                with sync_c2:
+                    clear_snapshot_clicked = st.button(
+                        "Fjern snapshot",
+                        key=f"assignee_clear_devops_snapshot_{bug.id}",
+                        use_container_width=True,
+                    )
+
+                if apply_snapshot_clicked:
+                    apply_error = _apply_devops_snapshot_to_local_bug(user, bug_id=bug.id, snapshot=devops_snapshot)
+                    if apply_error:
+                        st.error(apply_error)
+                    else:
+                        st.session_state.pop(devops_snapshot_key, None)
+                        st.success("Lokal bug oppdatert fra DevOps.")
+                        st.rerun()
+                if clear_snapshot_clicked:
+                    st.session_state.pop(devops_snapshot_key, None)
                     st.rerun()
 
             action_b1, action_b2, action_b3 = st.columns(3)

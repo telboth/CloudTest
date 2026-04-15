@@ -3,14 +3,18 @@ from __future__ import annotations
 import os
 import sys
 import json
+import html
 import time
+import base64
 import re
 import csv
+import smtplib
 import shutil
 import sqlite3
 import tempfile
 import zipfile
 from io import BytesIO, StringIO
+from email.message import EmailMessage
 from difflib import SequenceMatcher
 from contextlib import contextmanager
 from datetime import date, datetime, timedelta, timezone
@@ -18,11 +22,20 @@ from pathlib import Path
 from collections.abc import Mapping
 from statistics import mean, median
 from typing import Any, Callable
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlencode
+from urllib.request import Request, urlopen
+from urllib.error import HTTPError, URLError
 from uuid import uuid4
 
 CLOUD_ROOT = Path(__file__).resolve().parent
 PROJECT_ROOT = CLOUD_ROOT.parent
+
+
+def _is_truthy(value: str | None, *, default: bool = False) -> bool:
+    normalized = str(value or "").strip().casefold()
+    if not normalized:
+        return default
+    return normalized in {"1", "true", "yes", "on"}
 
 
 def _prioritize_cloudtest_on_sys_path() -> None:
@@ -96,17 +109,14 @@ def _bootstrap_cloud_test_env_from_secrets() -> None:
         if value is not None and str(value).strip():
             os.environ[env_key] = str(value).strip()
 
-    def _truthy(value: str | None) -> bool:
-        return str(value or "").strip().casefold() in {"1", "true", "yes", "on"}
-
     def _host_from_database_url(database_url: str) -> str:
         try:
             return str(urlparse(database_url).hostname or "").strip().casefold()
         except Exception:
             return ""
 
-    running_on_streamlit_cloud = _truthy(os.getenv("STREAMLIT_CLOUD"))
-    allow_sqlite_fallback = _truthy(os.getenv("CLOUD_TEST_ALLOW_SQLITE_FALLBACK"))
+    running_on_streamlit_cloud = _is_truthy(os.getenv("STREAMLIT_CLOUD"))
+    allow_sqlite_fallback = _is_truthy(os.getenv("CLOUD_TEST_ALLOW_SQLITE_FALLBACK"))
     database_url = str(os.getenv("DATABASE_URL") or "").strip()
     if running_on_streamlit_cloud:
         sqlite_url = f"sqlite:///{(CLOUD_ROOT / 'bug_tracker_cloud.db').as_posix()}"
@@ -133,9 +143,9 @@ from foundation import (
     format_datetime_display,
     normalize_bug_status,
     render_sidebar_logo,
+    render_sidebar_bug_filters,
     render_bug_list_controls,
     render_bug_status_summary,
-    render_sidebar_bug_filters,
     render_sidebar_search,
     status_label,
 )
@@ -145,7 +155,17 @@ from app.core.logging import get_logger
 from app.core.security import get_password_hash, verify_password
 from app.models.background_job import BackgroundJob
 from app.models.bug import AppRuntimeMeta, Attachment, Bug, BugComment, BugHistory, BugSearchIndex
+from app.models.notification import InAppNotification, NotificationOutboxEvent
 from app.models.user import User
+from app.services.devops import (
+    DevOpsConfig,
+    create_bug_work_item,
+    fetch_bug_work_item,
+    list_assignable_devops_users,
+    remove_bug_work_item,
+    test_connection as test_devops_connection,
+    update_bug_work_item,
+)
 from app.services.health import get_ready_health
 from app.services.search import (
     get_search_telemetry_snapshot,
@@ -178,6 +198,7 @@ from page_reporter import render_reporter_page as _render_reporter_page_module
 
 logger = get_logger("cloud_test.unified")
 _ATTACHMENT_STORAGE = build_attachment_storage()
+_SMTP_OAUTH2_TOKEN_CACHE: dict[str, tuple[str, float]] = {}
 
 
 def _patch_streamlit_oidc_none_session() -> None:
@@ -439,23 +460,19 @@ def _mask_database_url(url: str) -> str:
 
 
 def _pgvector_forced_text_fallback() -> bool:
-    value = str(os.getenv("BUGSEARCH_DISABLE_PGVECTOR", "")).strip().casefold()
-    return value in {"1", "true", "yes", "on"}
+    return _is_truthy(os.getenv("BUGSEARCH_DISABLE_PGVECTOR", ""))
 
 
 def _cloud_test_mode_enabled() -> bool:
-    value = str(os.getenv("STREAMLIT_CLOUD_TEST_MODE", "")).strip().casefold()
-    return value in {"1", "true", "yes", "on"}
+    return _is_truthy(os.getenv("STREAMLIT_CLOUD_TEST_MODE", ""))
 
 
 def _legacy_schema_bootstrap_enabled() -> bool:
-    value = str(os.getenv("CLOUDTEST_ENABLE_LEGACY_SCHEMA_BOOTSTRAP", "")).strip().casefold()
-    return value in {"1", "true", "yes", "on"}
+    return _is_truthy(os.getenv("CLOUDTEST_ENABLE_LEGACY_SCHEMA_BOOTSTRAP", ""))
 
 
 def _allow_migration_failure_fallback() -> bool:
-    value = str(os.getenv("CLOUDTEST_ALLOW_MIGRATION_FALLBACK", "true")).strip().casefold()
-    return value in {"1", "true", "yes", "on"}
+    return _is_truthy(os.getenv("CLOUDTEST_ALLOW_MIGRATION_FALLBACK", "true"))
 
 
 def _is_external_postgres_url(url: str) -> bool:
@@ -631,6 +648,331 @@ def _run_rebuild_index_job(*, embedding_provider: str, embedding_model: str) -> 
         }
 
 
+def _save_devops_bulk_sync_summary(summary: dict[str, Any]) -> None:
+    payload = json.dumps(summary, ensure_ascii=False)
+    with db_session() as db:
+        _runtime_meta_set(db, _DEVOPS_BULK_SYNC_LAST_SUMMARY_KEY, payload)
+        _commit_with_retry(db, operation="Lagring av DevOps bulk-sync sammendrag")
+
+
+def _load_devops_bulk_sync_summary() -> dict[str, Any] | None:
+    try:
+        with db_session() as db:
+            raw = _runtime_meta_get(db, _DEVOPS_BULK_SYNC_LAST_SUMMARY_KEY, "")
+    except Exception:
+        return None
+    text = str(raw or "").strip()
+    if not text:
+        return None
+    try:
+        parsed = json.loads(text)
+    except Exception:
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    return parsed
+
+
+def _save_devops_bulk_push_summary(summary: dict[str, Any]) -> None:
+    payload = json.dumps(summary, ensure_ascii=False)
+    with db_session() as db:
+        _runtime_meta_set(db, _DEVOPS_BULK_PUSH_LAST_SUMMARY_KEY, payload)
+        _commit_with_retry(db, operation="Lagring av DevOps bulk-push sammendrag")
+
+
+def _load_devops_bulk_push_summary() -> dict[str, Any] | None:
+    try:
+        with db_session() as db:
+            raw = _runtime_meta_get(db, _DEVOPS_BULK_PUSH_LAST_SUMMARY_KEY, "")
+    except Exception:
+        return None
+    text = str(raw or "").strip()
+    if not text:
+        return None
+    try:
+        parsed = json.loads(text)
+    except Exception:
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    return parsed
+
+
+def _run_devops_bulk_pull_job(*, actor_email: str, config: DevOpsConfig) -> dict[str, Any]:
+    started_at = datetime.now(timezone.utc)
+    summary: dict[str, Any] = {
+        "started_at": started_at.isoformat(),
+        "finished_at": "",
+        "linked": 0,
+        "updated": 0,
+        "unchanged": 0,
+        "failed": 0,
+        "skipped": 0,
+        "failed_samples": [],
+    }
+    max_failed_samples = 8
+
+    try:
+        with db_session() as db:
+            linked_bug_ids = [
+                int(item)
+                for item in db.scalars(
+                    select(Bug.id)
+                    .where(Bug.deleted_at.is_(None))
+                    .where(Bug.ado_work_item_id.is_not(None))
+                    .order_by(Bug.id.asc())
+                ).all()
+            ]
+        summary["linked"] = len(linked_bug_ids)
+
+        for bug_id in linked_bug_ids:
+            try:
+                with db_session() as db:
+                    bug = db.get(Bug, int(bug_id))
+                    if bug is None or _is_deleted_bug(bug) or not bug.ado_work_item_id:
+                        summary["skipped"] = int(summary.get("skipped", 0)) + 1
+                        continue
+
+                    payload = fetch_bug_work_item(config, work_item_id=int(bug.ado_work_item_id))
+                    remote_values = _extract_devops_remote_values(payload.get("fields"))
+                    if not str(remote_values.get("title") or "").strip():
+                        remote_values["title"] = str(bug.title or "").strip()
+                    if not str(remote_values.get("description") or "").strip():
+                        remote_values["description"] = str(bug.description or "").strip()
+
+                    status_value = normalize_bug_status(remote_values.get("status"))
+                    severity_value = str(remote_values.get("severity") or "medium").strip().casefold()
+                    assignee_value = _normalize_email(remote_values.get("assignee_id"))
+                    tags_value = _devops_normalize_tags(remote_values.get("tags"))
+                    if status_value not in set(STATUS_OPTIONS):
+                        status_value = "open"
+                    if severity_value not in set(SEVERITY_OPTIONS):
+                        severity_value = "medium"
+
+                    changed_fields: list[str] = []
+                    title_value = str(remote_values.get("title") or "").strip()
+                    description_value = str(remote_values.get("description") or "").strip()
+                    if title_value and str(bug.title or "").strip() != title_value:
+                        bug.title = title_value
+                        changed_fields.append("title")
+                    if description_value and str(bug.description or "").strip() != description_value:
+                        bug.description = description_value
+                        changed_fields.append("description")
+
+                    if normalize_bug_status(bug.status) != status_value:
+                        bug.status = status_value
+                        changed_fields.append("status")
+                    if str(bug.severity or "").strip().casefold() != severity_value:
+                        bug.severity = severity_value
+                        changed_fields.append("severity")
+
+                    current_assignee = _normalize_email(bug.assignee_id)
+                    if current_assignee != assignee_value:
+                        if assignee_value:
+                            _ensure_user_exists(db, email=assignee_value, role=_role_for_email(assignee_value))
+                        bug.assignee_id = assignee_value or None
+                        changed_fields.append("assignee_id")
+
+                    current_tags = _devops_normalize_tags(bug.tags)
+                    if current_tags != tags_value:
+                        bug.tags = tags_value or None
+                        changed_fields.append("tags")
+
+                    if status_value == "resolved":
+                        if bug.closed_at is None:
+                            bug.closed_at = datetime.now(timezone.utc)
+                    else:
+                        bug.closed_at = None
+
+                    remote_url = str(payload.get("url") or "").strip()
+                    if remote_url and str(bug.ado_work_item_url or "").strip() != remote_url:
+                        bug.ado_work_item_url = remote_url
+                        changed_fields.append("ado_work_item_url")
+                    bug.ado_sync_status = "synced"
+                    bug.ado_synced_at = datetime.now(timezone.utc)
+
+                    if changed_fields:
+                        _write_history(
+                            db,
+                            bug_id=bug.id,
+                            actor_email=actor_email,
+                            action="devops_pulled",
+                            details=(
+                                f"Bulk-sync fra DevOps work item #{int(bug.ado_work_item_id)}. "
+                                f"Felter: {', '.join(sorted(set(changed_fields)))}."
+                            ),
+                        )
+                        try:
+                            db.flush()
+                            mark_bug_search_index_dirty_by_id(
+                                db,
+                                bug_id=bug.id,
+                                embedding_provider=None,
+                                embedding_model=None,
+                            )
+                        except Exception as mark_exc:
+                            logger.warning(
+                                "Bulk-sync could not mark search index dirty for bug_id=%s: %s",
+                                bug.id,
+                                mark_exc.__class__.__name__,
+                            )
+                        summary["updated"] = int(summary.get("updated", 0)) + 1
+                    else:
+                        summary["unchanged"] = int(summary.get("unchanged", 0)) + 1
+
+                    _commit_with_retry(db, operation="Bulk sync fra DevOps")
+            except Exception as exc:
+                summary["failed"] = int(summary.get("failed", 0)) + 1
+                if len(summary["failed_samples"]) < max_failed_samples:
+                    summary["failed_samples"].append(
+                        {
+                            "bug_id": int(bug_id),
+                            "error": format_user_error(
+                                "Bulk-sync av bug feilet",
+                                exc,
+                                fallback="Ukjent feil mot DevOps.",
+                            ),
+                        }
+                    )
+
+        summary["finished_at"] = datetime.now(timezone.utc).isoformat()
+        summary["duration_ms"] = int((datetime.now(timezone.utc) - started_at).total_seconds() * 1000)
+        try:
+            _save_devops_bulk_sync_summary(summary)
+        except Exception as save_exc:
+            logger.warning("Could not persist DevOps bulk-sync summary: %s", save_exc.__class__.__name__)
+        return summary
+    except Exception as exc:
+        logger.exception("DevOps bulk-sync job failed before completion")
+        error_payload = {
+            "error": format_user_error(
+                "Bulk-sync fra DevOps feilet",
+                exc,
+                fallback="Sjekk driftslogger for detaljer.",
+            ),
+            "started_at": started_at.isoformat(),
+            "finished_at": datetime.now(timezone.utc).isoformat(),
+        }
+        try:
+            _save_devops_bulk_sync_summary(error_payload)
+        except Exception:
+            pass
+        return error_payload
+
+
+def _run_devops_bulk_push_job(*, actor_email: str, config: DevOpsConfig) -> dict[str, Any]:
+    started_at = datetime.now(timezone.utc)
+    summary: dict[str, Any] = {
+        "started_at": started_at.isoformat(),
+        "finished_at": "",
+        "linked": 0,
+        "updated": 0,
+        "failed": 0,
+        "skipped": 0,
+        "failed_samples": [],
+    }
+    max_failed_samples = 8
+
+    try:
+        with db_session() as db:
+            linked_bug_ids = [
+                int(item)
+                for item in db.scalars(
+                    select(Bug.id)
+                    .where(Bug.deleted_at.is_(None))
+                    .where(Bug.ado_work_item_id.is_not(None))
+                    .order_by(Bug.id.asc())
+                ).all()
+            ]
+        summary["linked"] = len(linked_bug_ids)
+
+        for bug_id in linked_bug_ids:
+            try:
+                with db_session() as db:
+                    bug = db.get(Bug, int(bug_id))
+                    if bug is None or _is_deleted_bug(bug) or not bug.ado_work_item_id:
+                        summary["skipped"] = int(summary.get("skipped", 0)) + 1
+                        continue
+
+                    status_value = normalize_bug_status(bug.status)
+                    severity_value = str(bug.severity or "medium").strip().casefold()
+                    if status_value not in set(STATUS_OPTIONS):
+                        status_value = "open"
+                    if severity_value not in set(SEVERITY_OPTIONS):
+                        severity_value = "medium"
+                    assignee_value = _normalize_email(bug.assignee_id)
+
+                    work_item_id, work_item_url = update_bug_work_item(
+                        config,
+                        work_item_id=int(bug.ado_work_item_id),
+                        title=str(bug.title or "").strip() or f"Bug #{bug.id}",
+                        description=str(bug.description or "").strip(),
+                        severity=severity_value,
+                        status=status_value,
+                        tags=str(bug.tags or "").strip() or None,
+                        assignee_email=assignee_value,
+                        changed_fields=[
+                            "title",
+                            "description",
+                            "status",
+                            "severity",
+                            "tags",
+                            "assignee_id",
+                        ],
+                        comment_text=None,
+                    )
+
+                    bug.ado_work_item_url = str(work_item_url).strip() or bug.ado_work_item_url
+                    bug.ado_sync_status = "synced"
+                    bug.ado_synced_at = datetime.now(timezone.utc)
+                    _write_history(
+                        db,
+                        bug_id=bug.id,
+                        actor_email=actor_email,
+                        action="devops_updated",
+                        details=f"Bulk-push oppdaterte Azure DevOps work item #{int(work_item_id)}.",
+                    )
+                    _commit_with_retry(db, operation="Bulk push til DevOps")
+                    summary["updated"] = int(summary.get("updated", 0)) + 1
+            except Exception as exc:
+                summary["failed"] = int(summary.get("failed", 0)) + 1
+                if len(summary["failed_samples"]) < max_failed_samples:
+                    summary["failed_samples"].append(
+                        {
+                            "bug_id": int(bug_id),
+                            "error": format_user_error(
+                                "Bulk-push av bug feilet",
+                                exc,
+                                fallback="Ukjent feil mot DevOps.",
+                            ),
+                        }
+                    )
+
+        summary["finished_at"] = datetime.now(timezone.utc).isoformat()
+        summary["duration_ms"] = int((datetime.now(timezone.utc) - started_at).total_seconds() * 1000)
+        try:
+            _save_devops_bulk_push_summary(summary)
+        except Exception as save_exc:
+            logger.warning("Could not persist DevOps bulk-push summary: %s", save_exc.__class__.__name__)
+        return summary
+    except Exception as exc:
+        logger.exception("DevOps bulk-push job failed before completion")
+        error_payload = {
+            "error": format_user_error(
+                "Bulk-push til DevOps feilet",
+                exc,
+                fallback="Sjekk driftslogger for detaljer.",
+            ),
+            "started_at": started_at.isoformat(),
+            "finished_at": datetime.now(timezone.utc).isoformat(),
+        }
+        try:
+            _save_devops_bulk_push_summary(error_payload)
+        except Exception:
+            pass
+        return error_payload
+
+
 def _get_admin_health_snapshot(*, force_refresh: bool = False) -> dict[str, Any]:
     state_key = "admin_health_snapshot"
     if force_refresh or state_key not in st.session_state:
@@ -660,7 +1002,7 @@ def _get_admin_health_snapshot(*, force_refresh: bool = False) -> dict[str, Any]
 def _render_admin_operations_panel(user: dict[str, str]) -> None:
     st.caption("Drift")
     with st.expander("Indeks og drift", expanded=False):
-        c1, c2 = st.columns(2)
+        c1, c2, c3, c4 = st.columns(4)
         rebuild_clicked = c1.button(
             "Rebuild index",
             key="admin_rebuild_index",
@@ -672,6 +1014,18 @@ def _render_admin_operations_panel(user: dict[str, str]) -> None:
             key="admin_health_refresh",
             use_container_width=True,
             help="Henter ny health-status fra runtime-sjekkene.",
+        )
+        devops_bulk_sync_clicked = c3.button(
+            "Synk alle DevOps-bugs",
+            key="admin_devops_bulk_sync",
+            use_container_width=True,
+            help="Henter siste data fra DevOps for alle koblede bugs og oppdaterer lokal database.",
+        )
+        devops_bulk_push_clicked = c4.button(
+            "Publiser alle til DevOps",
+            key="admin_devops_bulk_push",
+            use_container_width=True,
+            help="Pusher alle koblede bugs fra lokal database til DevOps work items.",
         )
 
         if rebuild_clicked:
@@ -687,6 +1041,40 @@ def _render_admin_operations_panel(user: dict[str, str]) -> None:
                 ),
             )
             st.rerun()
+
+        if devops_bulk_sync_clicked:
+            config, config_error = _build_effective_devops_config(user, require_access=True)
+            if config is None:
+                st.error(str(config_error or "DevOps er ikke tilgjengelig."))
+            else:
+                _start_background_job(
+                    prefix="admin",
+                    bug_id=0,
+                    job_key="devops_bulk_pull",
+                    job_label="DevOps bulk sync",
+                    target=lambda cfg=config, actor=user["email"]: _run_devops_bulk_pull_job(
+                        actor_email=str(actor),
+                        config=cfg,
+                    ),
+                )
+                st.rerun()
+
+        if devops_bulk_push_clicked:
+            config, config_error = _build_effective_devops_config(user, require_access=True)
+            if config is None:
+                st.error(str(config_error or "DevOps er ikke tilgjengelig."))
+            else:
+                _start_background_job(
+                    prefix="admin",
+                    bug_id=0,
+                    job_key="devops_bulk_push",
+                    job_label="DevOps bulk push",
+                    target=lambda cfg=config, actor=user["email"]: _run_devops_bulk_push_job(
+                        actor_email=str(actor),
+                        config=cfg,
+                    ),
+                )
+                st.rerun()
 
         tracked = _get_tracked_job("admin", 0, "rebuild_index")
         if tracked:
@@ -718,6 +1106,139 @@ def _render_admin_operations_panel(user: dict[str, str]) -> None:
                     _clear_tracked_job("admin", 0, "rebuild_index")
                     _finalize_background_job(tracked_job_id)
                     _clear_bug_cache()
+
+        tracked_bulk = _get_tracked_job("admin", 0, "devops_bulk_pull")
+        if tracked_bulk:
+            tracked_job_id = int(tracked_bulk.get("job_id", 0) or 0)
+            job_payload = _get_background_job(tracked_job_id)
+            if job_payload is None:
+                _clear_tracked_job("admin", 0, "devops_bulk_pull")
+            else:
+                status = str(job_payload.get("status") or "unknown")
+                if status in {"pending", "running"}:
+                    st.info("DevOps bulk-sync kjører i bakgrunnen.")
+                    if st.button(
+                        "Oppdater DevOps jobbstatus",
+                        key="admin_devops_bulk_refresh_status",
+                        use_container_width=True,
+                    ):
+                        st.rerun()
+                else:
+                    result = job_payload.get("result")
+                    error_text = ""
+                    if isinstance(result, dict):
+                        error_text = str(result.get("error") or "").strip()
+                    if not error_text:
+                        error_text = str(job_payload.get("error") or "").strip()
+                    if error_text:
+                        st.error(error_text)
+                    else:
+                        updated = int((result or {}).get("updated") or 0) if isinstance(result, dict) else 0
+                        unchanged = int((result or {}).get("unchanged") or 0) if isinstance(result, dict) else 0
+                        failed = int((result or {}).get("failed") or 0) if isinstance(result, dict) else 0
+                        linked = int((result or {}).get("linked") or 0) if isinstance(result, dict) else 0
+                        skipped = int((result or {}).get("skipped") or 0) if isinstance(result, dict) else 0
+                        st.success(
+                            "DevOps bulk-sync fullført. "
+                            f"Koblede: {linked}, oppdatert: {updated}, uendret: {unchanged}, "
+                            f"feilet: {failed}, hoppet over: {skipped}."
+                        )
+                        failed_samples = (result or {}).get("failed_samples") if isinstance(result, dict) else []
+                        if isinstance(failed_samples, list) and failed_samples:
+                            st.warning("Noen bugs feilet under bulk-sync:")
+                            for item in failed_samples[:8]:
+                                if not isinstance(item, dict):
+                                    continue
+                                bug_id = str(item.get("bug_id") or "-").strip()
+                                error_detail = str(item.get("error") or "Ukjent feil").strip()
+                                st.caption(f"#{bug_id}: {error_detail}")
+                    _clear_tracked_job("admin", 0, "devops_bulk_pull")
+                    _finalize_background_job(tracked_job_id)
+                    _clear_bug_cache()
+
+        tracked_bulk_push = _get_tracked_job("admin", 0, "devops_bulk_push")
+        if tracked_bulk_push:
+            tracked_job_id = int(tracked_bulk_push.get("job_id", 0) or 0)
+            job_payload = _get_background_job(tracked_job_id)
+            if job_payload is None:
+                _clear_tracked_job("admin", 0, "devops_bulk_push")
+            else:
+                status = str(job_payload.get("status") or "unknown")
+                if status in {"pending", "running"}:
+                    st.info("DevOps bulk-push kjører i bakgrunnen.")
+                    if st.button(
+                        "Oppdater DevOps push-status",
+                        key="admin_devops_bulk_push_refresh_status",
+                        use_container_width=True,
+                    ):
+                        st.rerun()
+                else:
+                    result = job_payload.get("result")
+                    error_text = ""
+                    if isinstance(result, dict):
+                        error_text = str(result.get("error") or "").strip()
+                    if not error_text:
+                        error_text = str(job_payload.get("error") or "").strip()
+                    if error_text:
+                        st.error(error_text)
+                    else:
+                        updated = int((result or {}).get("updated") or 0) if isinstance(result, dict) else 0
+                        failed = int((result or {}).get("failed") or 0) if isinstance(result, dict) else 0
+                        linked = int((result or {}).get("linked") or 0) if isinstance(result, dict) else 0
+                        skipped = int((result or {}).get("skipped") or 0) if isinstance(result, dict) else 0
+                        st.success(
+                            "DevOps bulk-push fullført. "
+                            f"Koblede: {linked}, oppdatert: {updated}, feilet: {failed}, hoppet over: {skipped}."
+                        )
+                        failed_samples = (result or {}).get("failed_samples") if isinstance(result, dict) else []
+                        if isinstance(failed_samples, list) and failed_samples:
+                            st.warning("Noen bugs feilet under bulk-push:")
+                            for item in failed_samples[:8]:
+                                if not isinstance(item, dict):
+                                    continue
+                                bug_id = str(item.get("bug_id") or "-").strip()
+                                error_detail = str(item.get("error") or "Ukjent feil").strip()
+                                st.caption(f"#{bug_id}: {error_detail}")
+                    _clear_tracked_job("admin", 0, "devops_bulk_push")
+                    _finalize_background_job(tracked_job_id)
+                    _clear_bug_cache()
+
+        last_bulk_summary = _load_devops_bulk_sync_summary()
+        if isinstance(last_bulk_summary, dict) and last_bulk_summary:
+            if str(last_bulk_summary.get("error") or "").strip():
+                st.caption(
+                    "Siste DevOps bulk-sync feilet: "
+                    f"{str(last_bulk_summary.get('error') or '').strip()}"
+                )
+            else:
+                st.caption(
+                    "Siste DevOps bulk-sync: "
+                    f"koblede={int(last_bulk_summary.get('linked') or 0)}, "
+                    f"oppdatert={int(last_bulk_summary.get('updated') or 0)}, "
+                    f"uendret={int(last_bulk_summary.get('unchanged') or 0)}, "
+                    f"feilet={int(last_bulk_summary.get('failed') or 0)}"
+                )
+            finished = str(last_bulk_summary.get("finished_at") or "").strip()
+            if finished:
+                st.caption(f"Sist kjørt: {finished}")
+
+        last_bulk_push_summary = _load_devops_bulk_push_summary()
+        if isinstance(last_bulk_push_summary, dict) and last_bulk_push_summary:
+            if str(last_bulk_push_summary.get("error") or "").strip():
+                st.caption(
+                    "Siste DevOps bulk-push feilet: "
+                    f"{str(last_bulk_push_summary.get('error') or '').strip()}"
+                )
+            else:
+                st.caption(
+                    "Siste DevOps bulk-push: "
+                    f"koblede={int(last_bulk_push_summary.get('linked') or 0)}, "
+                    f"oppdatert={int(last_bulk_push_summary.get('updated') or 0)}, "
+                    f"feilet={int(last_bulk_push_summary.get('failed') or 0)}"
+                )
+            finished = str(last_bulk_push_summary.get("finished_at") or "").strip()
+            if finished:
+                st.caption(f"Sist publisert: {finished}")
 
         health_snapshot = _get_admin_health_snapshot(force_refresh=refresh_health_clicked)
         health_payload = health_snapshot.get("payload") if isinstance(health_snapshot, dict) else {}
@@ -1234,13 +1755,41 @@ def _build_assignable_emails() -> list[str]:
         query = select(User.email, User.role)
         rows = db.execute(query).all()
     allowed_roles = {"assignee", "admin"}
-    return sorted(
-        {
-            _normalize_email(email)
-            for email, role in rows
-            if _normalize_email(email) and str(role or "").strip().casefold() in allowed_roles
-        }
-    )
+    merged_emails = {
+        _normalize_email(email)
+        for email, role in rows
+        if _normalize_email(email) and str(role or "").strip().casefold() in allowed_roles
+    }
+
+    current_user = _current_user()
+    if current_user and _is_entra_session(current_user) and _devops_ui_enabled():
+        payload = _load_devops_settings()
+        config_org = str(payload.get("resolved_org") or "").strip()
+        config_project = str(payload.get("resolved_project") or "").strip()
+        config_pat = str(payload.get("resolved_pat") or "").strip()
+        config_work_item_type = str(payload.get("resolved_work_item_type") or "Task").strip() or "Task"
+        if config_org and config_project and config_pat:
+            try:
+                devops_users = list_assignable_devops_users(
+                    DevOpsConfig(
+                        org=config_org,
+                        project=config_project,
+                        pat=config_pat,
+                        work_item_type=config_work_item_type,
+                    ),
+                    timeout_seconds=12.0,
+                )
+                merged_emails.update(
+                    _normalize_email(str(item.get("email") or ""))
+                    for item in devops_users
+                    if isinstance(item, dict) and _normalize_email(str(item.get("email") or ""))
+                )
+            except RuntimeError as exc:
+                logger.warning("DevOps assignable user lookup skipped: %s", exc)
+            except Exception as exc:
+                logger.warning("DevOps assignable user lookup failed: %s", exc.__class__.__name__)
+
+    return sorted(merged_emails)
 
 
 def _assignee_select_options(current: str | None, assignable_emails: list[str]) -> list[str]:
@@ -2291,16 +2840,776 @@ def _runtime_meta_set(db, key: str, value: str) -> None:
         row.value = str(value)
 
 
+def _runtime_meta_delete(db, key: str) -> None:
+    row = db.get(AppRuntimeMeta, key)
+    if row is not None:
+        db.delete(row)
+
+
+_DEVOPS_META_KEYS: dict[str, str] = {
+    "enabled": "devops.enabled",
+    "org": "devops.org",
+    "project": "devops.project",
+    "pat": "devops.pat",
+    "work_item_type": "devops.work_item_type",
+}
+_DEVOPS_BULK_SYNC_LAST_SUMMARY_KEY = "devops.bulk_sync.last_summary"
+_DEVOPS_BULK_PUSH_LAST_SUMMARY_KEY = "devops.bulk_push.last_summary"
+
+
+def _mask_secret(value: str) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    if len(raw) <= 8:
+        return "*" * len(raw)
+    return f"{raw[:4]}{'*' * max(4, len(raw) - 8)}{raw[-4:]}"
+
+
+def _load_devops_settings() -> dict[str, Any]:
+    config_enabled_raw = str(_config_value("ENABLE_DEVOPS_IN_UI", "false") or "").strip()
+    secret_org = str(_config_value("AZURE_DEVOPS_ORG", "") or "").strip()
+    secret_project = str(_config_value("AZURE_DEVOPS_PROJECT", "") or "").strip()
+    secret_pat = str(_config_value("AZURE_DEVOPS_PAT", "") or "").strip()
+    secret_work_item_type = str(_config_value("AZURE_DEVOPS_WORK_ITEM_TYPE", "Task") or "Task").strip()
+
+    override_enabled_raw = ""
+    override_org = ""
+    override_project = ""
+    override_pat = ""
+    override_work_item_type = ""
+    try:
+        with db_session() as db:
+            override_enabled_raw = str(_runtime_meta_get(db, _DEVOPS_META_KEYS["enabled"], "") or "").strip()
+            override_org = str(_runtime_meta_get(db, _DEVOPS_META_KEYS["org"], "") or "").strip()
+            override_project = str(_runtime_meta_get(db, _DEVOPS_META_KEYS["project"], "") or "").strip()
+            override_pat = str(_runtime_meta_get(db, _DEVOPS_META_KEYS["pat"], "") or "").strip()
+            override_work_item_type = str(_runtime_meta_get(db, _DEVOPS_META_KEYS["work_item_type"], "") or "").strip()
+    except Exception:
+        override_enabled_raw = ""
+        override_org = ""
+        override_project = ""
+        override_pat = ""
+        override_work_item_type = ""
+
+    override_enabled = ""
+    if override_enabled_raw:
+        normalized = override_enabled_raw.casefold()
+        if normalized in {"1", "true", "yes", "on", "0", "false", "no", "off"}:
+            override_enabled = normalized
+
+    resolved_enabled = _is_truthy(override_enabled) if override_enabled else _is_truthy(config_enabled_raw)
+    resolved_org = override_org or secret_org
+    resolved_project = override_project or secret_project
+    resolved_pat = override_pat or secret_pat
+    resolved_work_item_type = (override_work_item_type or secret_work_item_type or "Task").strip() or "Task"
+    return {
+        "config_enabled_raw": config_enabled_raw,
+        "override_enabled": override_enabled,
+        "resolved_enabled": bool(resolved_enabled),
+        "enabled_source": "override" if override_enabled else "config",
+        "secret_org": secret_org,
+        "secret_project": secret_project,
+        "secret_pat": secret_pat,
+        "override_org": override_org,
+        "override_project": override_project,
+        "override_pat": override_pat,
+        "override_work_item_type": override_work_item_type,
+        "resolved_org": resolved_org,
+        "resolved_project": resolved_project,
+        "resolved_pat": resolved_pat,
+        "secret_work_item_type": secret_work_item_type,
+        "resolved_work_item_type": resolved_work_item_type,
+        "org_source": "override" if override_org else ("secrets" if secret_org else "unset"),
+        "project_source": "override" if override_project else ("secrets" if secret_project else "unset"),
+        "pat_source": "override" if override_pat else ("secrets" if secret_pat else "unset"),
+        "work_item_type_source": "override"
+        if override_work_item_type
+        else ("secrets" if secret_work_item_type else "default"),
+    }
+
+
+def _devops_ui_enabled() -> bool:
+    payload = _load_devops_settings()
+    return bool(payload.get("resolved_enabled", False))
+
+
+def _build_effective_devops_config(
+    user: dict[str, str],
+    *,
+    require_access: bool = True,
+) -> tuple[DevOpsConfig | None, str | None]:
+    role = str(user.get("role") or "").strip().casefold()
+    if role not in {"admin", "assignee"}:
+        return None, "DevOps er kun tilgjengelig for Assignee og Admin."
+    if require_access:
+        access_allowed, access_reason = _devops_access_state(user)
+        if not access_allowed:
+            return None, access_reason
+    payload = _load_devops_settings()
+    org = str(payload.get("resolved_org") or "").strip()
+    project = str(payload.get("resolved_project") or "").strip()
+    pat = str(payload.get("resolved_pat") or "").strip()
+    work_item_type = str(payload.get("resolved_work_item_type") or "Task").strip() or "Task"
+    if not org or not project or not pat:
+        return None, "DevOps mangler konfigurasjon. Sett org/prosjekt/PAT i Admin -> DevOps-innstillinger."
+    return DevOpsConfig(org=org, project=project, pat=pat, work_item_type=work_item_type), None
+
+
+def _save_devops_settings(
+    user: dict[str, str],
+    *,
+    enabled: bool | None = None,
+    org: str,
+    project: str,
+    pat: str,
+    work_item_type: str = "Task",
+    keep_existing_pat: bool = True,
+) -> str | None:
+    access_allowed, access_reason = _devops_admin_manage_access_state(user)
+    if not access_allowed:
+        return access_reason
+
+    org_value = str(org or "").strip()
+    project_value = str(project or "").strip()
+    pat_value = str(pat or "").strip()
+    work_item_type_value = str(work_item_type or "Task").strip() or "Task"
+    try:
+        with db_session() as db:
+            if enabled is not None:
+                _runtime_meta_set(db, _DEVOPS_META_KEYS["enabled"], "true" if bool(enabled) else "false")
+            if org_value:
+                _runtime_meta_set(db, _DEVOPS_META_KEYS["org"], org_value)
+            else:
+                _runtime_meta_delete(db, _DEVOPS_META_KEYS["org"])
+
+            if project_value:
+                _runtime_meta_set(db, _DEVOPS_META_KEYS["project"], project_value)
+            else:
+                _runtime_meta_delete(db, _DEVOPS_META_KEYS["project"])
+
+            if pat_value:
+                _runtime_meta_set(db, _DEVOPS_META_KEYS["pat"], pat_value)
+            elif not keep_existing_pat:
+                _runtime_meta_delete(db, _DEVOPS_META_KEYS["pat"])
+
+            _runtime_meta_set(db, _DEVOPS_META_KEYS["work_item_type"], work_item_type_value)
+
+            _commit_with_retry(db, operation="Lagring av DevOps-innstillinger")
+    except RuntimeError as exc:
+        return str(exc)
+    except Exception as exc:
+        return format_user_error("Kunne ikke lagre DevOps-innstillinger", exc, fallback="Prøv igjen.")
+    return None
+
+
+def _reset_devops_settings(user: dict[str, str]) -> str | None:
+    access_allowed, access_reason = _devops_admin_manage_access_state(user)
+    if not access_allowed:
+        return access_reason
+    try:
+        with db_session() as db:
+            _runtime_meta_delete(db, _DEVOPS_META_KEYS["enabled"])
+            _runtime_meta_delete(db, _DEVOPS_META_KEYS["org"])
+            _runtime_meta_delete(db, _DEVOPS_META_KEYS["project"])
+            _runtime_meta_delete(db, _DEVOPS_META_KEYS["pat"])
+            _runtime_meta_delete(db, _DEVOPS_META_KEYS["work_item_type"])
+            _commit_with_retry(db, operation="Nullstilling av DevOps-innstillinger")
+    except RuntimeError as exc:
+        return str(exc)
+    except Exception as exc:
+        return format_user_error("Kunne ikke nullstille DevOps-innstillinger", exc, fallback="Prøv igjen.")
+    return None
+
+
+def _test_devops_settings(user: dict[str, str]) -> tuple[bool, str]:
+    access_allowed, access_reason = _devops_admin_manage_access_state(user)
+    if not access_allowed:
+        return False, access_reason
+    config, config_error = _build_effective_devops_config(user, require_access=False)
+    if config is None:
+        return False, str(config_error or "DevOps er ikke konfigurert.")
+    return test_devops_connection(config)
+
+
+def _devops_html_to_text(value: Any) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    text_value = re.sub(r"(?i)<br\\s*/?>", "\n", raw)
+    text_value = re.sub(r"(?i)</p>", "\n", text_value)
+    text_value = re.sub(r"<[^>]+>", "", text_value)
+    text_value = html.unescape(text_value)
+    text_value = re.sub(r"[ \t]+\n", "\n", text_value)
+    text_value = re.sub(r"\n{3,}", "\n\n", text_value)
+    return text_value.strip()
+
+
+def _devops_normalize_tags(value: Any) -> str:
+    entries = [str(item).strip() for item in re.split(r"[;,]+", str(value or "")) if str(item).strip()]
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for item in entries:
+        lowered = item.casefold()
+        if lowered in seen:
+            continue
+        seen.add(lowered)
+        deduped.append(item)
+    return ", ".join(deduped)
+
+
+def _map_devops_state_to_local_status(value: Any) -> str:
+    state = str(value or "").strip().casefold()
+    if state in {"resolved", "closed", "done", "removed", "completed"}:
+        return "resolved"
+    return "open"
+
+
+def _map_devops_severity_to_local(value: Any) -> str:
+    severity_text = str(value or "").strip().casefold()
+    if not severity_text:
+        return "medium"
+    if severity_text.startswith("1") or "critical" in severity_text:
+        return "critical"
+    if severity_text.startswith("2") or "high" in severity_text:
+        return "high"
+    if severity_text.startswith("4") or "low" in severity_text:
+        return "low"
+    return "medium"
+
+
+def _extract_devops_assignee_email(value: Any) -> str | None:
+    if isinstance(value, dict):
+        candidates = [
+            value.get("uniqueName"),
+            value.get("mailAddress"),
+            value.get("email"),
+            value.get("descriptor"),
+            value.get("displayName"),
+        ]
+        for candidate in candidates:
+            normalized = _extract_devops_assignee_email(candidate)
+            if normalized:
+                return normalized
+        return None
+
+    text_value = str(value or "").strip()
+    if not text_value:
+        return None
+    match = re.search(r"<([^>]+)>", text_value)
+    if match:
+        text_value = match.group(1).strip()
+    normalized = _normalize_email(text_value)
+    if not _is_valid_email(normalized):
+        return None
+    return normalized
+
+
+def _extract_devops_remote_values(fields: Mapping[str, Any] | Any) -> dict[str, Any]:
+    payload = fields if isinstance(fields, Mapping) else {}
+    return {
+        "title": str(payload.get("System.Title") or "").strip(),
+        "description": _devops_html_to_text(payload.get("System.Description")),
+        "status": _map_devops_state_to_local_status(payload.get("System.State")),
+        "severity": _map_devops_severity_to_local(payload.get("Microsoft.VSTS.Common.Severity")),
+        "assignee_id": _extract_devops_assignee_email(payload.get("System.AssignedTo")),
+        "tags": _devops_normalize_tags(payload.get("System.Tags")),
+    }
+
+
+def _fetch_bug_from_devops(user: dict[str, str], *, bug_id: int) -> tuple[str | None, dict[str, Any] | None]:
+    role = str(user.get("role") or "").strip().casefold()
+    if role not in {"admin", "assignee"}:
+        return "DevOps er kun tilgjengelig for Assignee og Admin.", None
+    config, config_error = _build_effective_devops_config(user, require_access=True)
+    if config is None:
+        return config_error or "DevOps er ikke tilgjengelig.", None
+
+    try:
+        with db_session() as db:
+            bug = db.get(Bug, bug_id)
+            if bug is None:
+                return "Fant ikke bug.", None
+            if _is_deleted_bug(bug):
+                return "Bugen ligger i papirkurv og kan ikke synkroniseres med DevOps.", None
+            if not bug.ado_work_item_id:
+                return "Bugen er ikke koblet til DevOps.", None
+
+            work_item_id = int(bug.ado_work_item_id)
+            payload = fetch_bug_work_item(config, work_item_id=work_item_id)
+            fields = payload.get("fields")
+            remote_values: dict[str, Any] = _extract_devops_remote_values(fields)
+            local_values: dict[str, Any] = {
+                "title": str(bug.title or "").strip(),
+                "description": str(bug.description or "").strip(),
+                "status": normalize_bug_status(bug.status),
+                "severity": str(bug.severity or "medium").strip().casefold(),
+                "assignee_id": _normalize_email(bug.assignee_id),
+                "tags": _devops_normalize_tags(bug.tags),
+            }
+
+            if not remote_values["title"]:
+                remote_values["title"] = local_values["title"]
+            if not remote_values["description"]:
+                remote_values["description"] = local_values["description"]
+
+            def _norm_text(value: Any) -> str:
+                return re.sub(r"\s+", " ", str(value or "").strip()).casefold()
+
+            compare_order = [
+                ("title", "Tittel"),
+                ("description", "Beskrivelse"),
+                ("status", "Status"),
+                ("severity", "Alvorlighetsgrad"),
+                ("assignee_id", "Tildelt"),
+                ("tags", "Tagger"),
+            ]
+            changes: list[dict[str, str]] = []
+            for field_key, label in compare_order:
+                local_value = local_values.get(field_key)
+                remote_value = remote_values.get(field_key)
+                is_same = False
+                if field_key in {"status", "severity", "assignee_id", "tags"}:
+                    is_same = _norm_text(local_value) == _norm_text(remote_value)
+                else:
+                    is_same = _norm_text(local_value) == _norm_text(remote_value)
+                if is_same:
+                    continue
+                changes.append(
+                    {
+                        "field": label,
+                        "local": str(local_value or "").strip() or "-",
+                        "devops": str(remote_value or "").strip() or "-",
+                    }
+                )
+
+            snapshot = {
+                "work_item_id": work_item_id,
+                "work_item_url": str(payload.get("url") or bug.ado_work_item_url or "").strip(),
+                "pulled_at": datetime.now(timezone.utc).isoformat(),
+                "values": remote_values,
+                "changes": changes,
+                "raw_state": str(((fields or {}).get("System.State") if isinstance(fields, Mapping) else "") or "").strip(),
+                "raw_severity": str(
+                    ((fields or {}).get("Microsoft.VSTS.Common.Severity") if isinstance(fields, Mapping) else "") or ""
+                ).strip(),
+            }
+            return None, snapshot
+    except RuntimeError as exc:
+        return str(exc), None
+    except Exception as exc:
+        return (
+            format_user_error(
+                "Kunne ikke hente work item fra DevOps",
+                exc,
+                fallback="Sjekk DevOps-oppsettet og prøv igjen.",
+            ),
+            None,
+        )
+
+
+def _apply_devops_snapshot_to_local_bug(user: dict[str, str], *, bug_id: int, snapshot: dict[str, Any]) -> str | None:
+    role = str(user.get("role") or "").strip().casefold()
+    if role not in {"admin", "assignee"}:
+        return "DevOps er kun tilgjengelig for Assignee og Admin."
+    if not isinstance(snapshot, dict):
+        return "Mangler gyldig DevOps-snapshot."
+
+    work_item_id = int(snapshot.get("work_item_id") or 0)
+    if work_item_id <= 0:
+        return "Mangler gyldig work item-id i DevOps-snapshot."
+
+    values = snapshot.get("values")
+    if not isinstance(values, dict):
+        return "Mangler verdier i DevOps-snapshot."
+
+    title_value = str(values.get("title") or "").strip()
+    description_value = str(values.get("description") or "").strip()
+    status_value = normalize_bug_status(values.get("status"))
+    severity_value = str(values.get("severity") or "").strip().casefold()
+    assignee_value = _normalize_email(values.get("assignee_id"))
+    tags_value = _devops_normalize_tags(values.get("tags"))
+
+    if status_value not in set(STATUS_OPTIONS):
+        status_value = "open"
+    if severity_value not in set(SEVERITY_OPTIONS):
+        severity_value = "medium"
+    if assignee_value and not _is_valid_email(assignee_value):
+        return "DevOps returnerte en ugyldig tildelt e-postadresse."
+
+    try:
+        with db_session() as db:
+            bug = db.get(Bug, bug_id)
+            if bug is None:
+                return "Fant ikke bug."
+            if _is_deleted_bug(bug):
+                return "Bugen ligger i papirkurv og kan ikke oppdateres."
+            if not bug.ado_work_item_id:
+                return "Bugen er ikke koblet til DevOps."
+            if int(bug.ado_work_item_id) != work_item_id:
+                return (
+                    f"Work item-id mismatch: lokal kobling peker på #{int(bug.ado_work_item_id)}, "
+                    f"mens snapshot er #{work_item_id}. Hent på nytt fra DevOps."
+                )
+
+            changed_fields: list[str] = []
+            if title_value and str(bug.title or "").strip() != title_value:
+                bug.title = title_value
+                changed_fields.append("title")
+            if description_value and str(bug.description or "").strip() != description_value:
+                bug.description = description_value
+                changed_fields.append("description")
+
+            previous_status = normalize_bug_status(bug.status)
+            if previous_status != status_value:
+                bug.status = status_value
+                changed_fields.append("status")
+            if str(bug.severity or "").strip().casefold() != severity_value:
+                bug.severity = severity_value
+                changed_fields.append("severity")
+
+            previous_assignee = _normalize_email(bug.assignee_id)
+            if previous_assignee != assignee_value:
+                if assignee_value:
+                    _ensure_user_exists(db, email=assignee_value, role=_role_for_email(assignee_value))
+                bug.assignee_id = assignee_value or None
+                changed_fields.append("assignee_id")
+
+            previous_tags = _devops_normalize_tags(bug.tags)
+            if previous_tags != tags_value:
+                bug.tags = tags_value or None
+                changed_fields.append("tags")
+
+            if status_value == "resolved":
+                if bug.closed_at is None:
+                    bug.closed_at = datetime.now(timezone.utc)
+            else:
+                bug.closed_at = None
+
+            snapshot_url = str(snapshot.get("work_item_url") or "").strip()
+            if snapshot_url and str(bug.ado_work_item_url or "").strip() != snapshot_url:
+                bug.ado_work_item_url = snapshot_url
+                if "ado_work_item_url" not in changed_fields:
+                    changed_fields.append("ado_work_item_url")
+            bug.ado_sync_status = "synced"
+            bug.ado_synced_at = datetime.now(timezone.utc)
+
+            details = f"Lokal bug oppdatert fra DevOps work item #{work_item_id}."
+            if changed_fields:
+                details = f"{details} Felter: {', '.join(sorted(set(changed_fields)))}."
+            else:
+                details = f"{details} Ingen feltendringer."
+            _write_history(
+                db,
+                bug_id=bug.id,
+                actor_email=user["email"],
+                action="devops_pulled",
+                details=details,
+            )
+            _mark_bug_search_index_dirty(db, bug_id=bug.id)
+            _commit_with_retry(db, operation="Oppdatering av lokal bug fra DevOps")
+    except RuntimeError as exc:
+        return str(exc)
+    except Exception as exc:
+        return format_user_error(
+            "Kunne ikke oppdatere lokal bug fra DevOps",
+            exc,
+            fallback="Prøv igjen.",
+        )
+
+    _clear_bug_cache()
+    return None
+
+
+def _send_bug_to_devops(user: dict[str, str], *, bug_id: int) -> tuple[str | None, str | None]:
+    role = str(user.get("role") or "").strip().casefold()
+    if role not in {"admin", "assignee"}:
+        return "DevOps er kun tilgjengelig for Assignee og Admin.", None
+    config, config_error = _build_effective_devops_config(user, require_access=True)
+    if config is None:
+        return config_error or "DevOps er ikke tilgjengelig.", None
+
+    try:
+        with db_session() as db:
+            bug = db.get(Bug, bug_id)
+            if bug is None:
+                return "Fant ikke bug.", None
+            if _is_deleted_bug(bug):
+                return "Bugen ligger i papirkurv og kan ikke sendes til DevOps.", None
+            if bug.ado_work_item_id:
+                return "Bugen er allerede sendt til DevOps.", str(bug.ado_work_item_url or "")
+
+            work_item_id, work_item_url, selected_work_item_type = create_bug_work_item(
+                config,
+                title=str(bug.title or "").strip() or f"Bug #{bug.id}",
+                description=str(bug.description or "").strip(),
+                severity=str(bug.severity or "medium"),
+                tags=str(bug.tags or "").strip() or None,
+                assignee_email=str(bug.assignee_id or "").strip() or None,
+                reporter_email=str(bug.reporter_id or "").strip() or None,
+                local_bug_id=int(bug.id),
+                work_item_type=str(config.work_item_type or "auto"),
+            )
+
+            bug.ado_work_item_id = int(work_item_id)
+            bug.ado_work_item_url = str(work_item_url).strip() or None
+            bug.ado_sync_status = "synced"
+            bug.ado_synced_at = datetime.now(timezone.utc)
+
+            details = (
+                f"Bug sendt til Azure DevOps work item #{work_item_id} "
+                f"(type: {selected_work_item_type})."
+            )
+            _write_history(
+                db,
+                bug_id=bug.id,
+                actor_email=user["email"],
+                action="devops_synced",
+                details=details,
+            )
+            _commit_with_retry(db, operation="Synkronisering mot DevOps")
+    except RuntimeError as exc:
+        return str(exc), None
+    except Exception as exc:
+        return format_user_error("Kunne ikke sende bug til DevOps", exc, fallback="Sjekk DevOps-oppsettet og prøv igjen."), None
+
+    _clear_bug_cache()
+    return None, work_item_url
+
+
+def _update_bug_in_devops(
+    user: dict[str, str],
+    *,
+    bug_id: int,
+    status: str | None = None,
+    severity: str | None = None,
+    assignee_id: str | None = None,
+    tags: str | None = None,
+    comment_text: str | None = None,
+    changed_fields: list[str] | None = None,
+) -> tuple[str | None, str | None]:
+    role = str(user.get("role") or "").strip().casefold()
+    if role not in {"admin", "assignee"}:
+        return "DevOps er kun tilgjengelig for Assignee og Admin.", None
+    config, config_error = _build_effective_devops_config(user, require_access=True)
+    if config is None:
+        return config_error or "DevOps er ikke tilgjengelig.", None
+
+    try:
+        with db_session() as db:
+            bug = db.get(Bug, bug_id)
+            if bug is None:
+                return "Fant ikke bug.", None
+            if _is_deleted_bug(bug):
+                return "Bugen ligger i papirkurv og kan ikke synkroniseres med DevOps.", None
+            if not bug.ado_work_item_id:
+                return "Bugen er ikke sendt til DevOps ennå.", None
+
+            status_value = normalize_bug_status(status or bug.status)
+            severity_value = str(severity or bug.severity or "medium").strip().casefold()
+            if severity_value not in set(SEVERITY_OPTIONS):
+                severity_value = str(bug.severity or "medium").strip().casefold()
+                if severity_value not in set(SEVERITY_OPTIONS):
+                    severity_value = "medium"
+            assignee_value = (assignee_id if assignee_id is not None else bug.assignee_id) or ""
+            assignee_value = str(assignee_value).strip().casefold() or None
+            tags_value = bug.tags if tags is None else tags
+            comment_value = str(comment_text or "").strip() or None
+
+            work_item_id, work_item_url = update_bug_work_item(
+                config,
+                work_item_id=int(bug.ado_work_item_id),
+                title=str(bug.title or "").strip() or f"Bug #{bug.id}",
+                description=str(bug.description or "").strip(),
+                severity=severity_value,
+                status=status_value,
+                tags=str(tags_value or "").strip() or None,
+                assignee_email=assignee_value,
+                changed_fields=[str(item).strip() for item in (changed_fields or []) if str(item).strip()] or None,
+                comment_text=comment_value,
+            )
+
+            bug.ado_work_item_url = str(work_item_url).strip() or bug.ado_work_item_url
+            bug.ado_sync_status = "synced"
+            bug.ado_synced_at = datetime.now(timezone.utc)
+
+            details_parts = [f"Bug oppdatert i Azure DevOps work item #{work_item_id}."]
+            if changed_fields:
+                cleaned_fields = [str(item).strip() for item in changed_fields if str(item).strip()]
+                if cleaned_fields:
+                    details_parts.append(f"Felter: {', '.join(sorted(set(cleaned_fields)))}.")
+            if comment_value:
+                details_parts.append("Kommentar sendt til DevOps.")
+            _write_history(
+                db,
+                bug_id=bug.id,
+                actor_email=user["email"],
+                action="devops_updated",
+                details=" ".join(details_parts),
+            )
+            _commit_with_retry(db, operation="Oppdatering i DevOps")
+    except RuntimeError as exc:
+        return str(exc), None
+    except Exception as exc:
+        return (
+            format_user_error(
+                "Kunne ikke oppdatere bug i DevOps",
+                exc,
+                fallback="Sjekk DevOps-oppsettet og prøv igjen.",
+            ),
+            None,
+        )
+
+    _clear_bug_cache()
+    return None, work_item_url
+
+
+def _is_devops_delete_permission_or_policy_error(message: str) -> bool:
+    lowered = str(message or "").strip().casefold()
+    if not lowered:
+        return False
+    indicators = (
+        "vs403145",
+        "insufficient permissions to delete",
+        "does not have permissions to delete",
+        "permission to delete work item",
+        "permission",
+        "access denied",
+        "forbidden",
+        "mangler rettighet",
+        "avviste sletting",
+    )
+    return any(token in lowered for token in indicators)
+
+
+def _remove_bug_from_devops(user: dict[str, str], *, bug_id: int) -> tuple[str | None, str | None]:
+    role = str(user.get("role") or "").strip().casefold()
+    if role not in {"admin", "assignee"}:
+        return "DevOps er kun tilgjengelig for Assignee og Admin.", None
+    config, config_error = _build_effective_devops_config(user, require_access=True)
+    if config is None:
+        return config_error or "DevOps er ikke tilgjengelig.", None
+
+    try:
+        with db_session() as db:
+            bug = db.get(Bug, bug_id)
+            if bug is None:
+                return "Fant ikke bug.", None
+            if _is_deleted_bug(bug):
+                return "Bugen ligger i papirkurv og kan ikke oppdateres.", None
+            if not bug.ado_work_item_id:
+                return "Bugen er ikke koblet til DevOps.", None
+
+            previous_work_item_id = int(bug.ado_work_item_id)
+            try:
+                remove_bug_work_item(config, work_item_id=previous_work_item_id)
+            except RuntimeError as exc:
+                remove_error = str(exc).strip()
+                if not _is_devops_delete_permission_or_policy_error(remove_error):
+                    raise
+
+                bug.ado_work_item_id = None
+                bug.ado_work_item_url = None
+                bug.ado_sync_status = "unlinked_local"
+                bug.ado_synced_at = datetime.now(timezone.utc)
+                _write_history(
+                    db,
+                    bug_id=bug.id,
+                    actor_email=user["email"],
+                    action="devops_unlinked_local",
+                    details=(
+                        f"Lokal DevOps-kobling til work item #{previous_work_item_id} ble fjernet automatisk "
+                        "etter mislykket sletting i DevOps. "
+                        f"Årsak: {remove_error[:400]}"
+                    ),
+                )
+                _commit_with_retry(db, operation="Lokal frakobling etter feilet DevOps-sletting")
+                _clear_bug_cache()
+                return (
+                    None,
+                    (
+                        f"Sletting i DevOps ble avvist. Lokal kobling ble fjernet automatisk, "
+                        f"men work item #{previous_work_item_id} finnes fortsatt i DevOps."
+                    ),
+                )
+
+            bug.ado_work_item_id = None
+            bug.ado_work_item_url = None
+            bug.ado_sync_status = "removed"
+            bug.ado_synced_at = datetime.now(timezone.utc)
+            _write_history(
+                db,
+                bug_id=bug.id,
+                actor_email=user["email"],
+                action="devops_removed",
+                details=f"Kobling mot Azure DevOps work item #{previous_work_item_id} ble fjernet.",
+            )
+            _commit_with_retry(db, operation="Fjerning fra DevOps")
+    except RuntimeError as exc:
+        return str(exc), None
+    except Exception as exc:
+        return (
+            format_user_error(
+                "Kunne ikke fjerne bug fra DevOps",
+                exc,
+                fallback="Sjekk DevOps-oppsettet og prøv igjen.",
+            ),
+            None,
+        )
+
+    _clear_bug_cache()
+    return None, "Bug fjernet fra DevOps."
+
+
+def _unlink_bug_from_devops_locally(user: dict[str, str], *, bug_id: int) -> str | None:
+    role = str(user.get("role") or "").strip().casefold()
+    if role not in {"admin", "assignee"}:
+        return "DevOps er kun tilgjengelig for Assignee og Admin."
+    try:
+        with db_session() as db:
+            bug = db.get(Bug, bug_id)
+            if bug is None:
+                return "Fant ikke bug."
+            if _is_deleted_bug(bug):
+                return "Bugen ligger i papirkurv og kan ikke oppdateres."
+            if not bug.ado_work_item_id:
+                return "Bugen er ikke koblet til DevOps."
+
+            previous_work_item_id = int(bug.ado_work_item_id)
+            bug.ado_work_item_id = None
+            bug.ado_work_item_url = None
+            bug.ado_sync_status = "unlinked_local"
+            bug.ado_synced_at = datetime.now(timezone.utc)
+            _write_history(
+                db,
+                bug_id=bug.id,
+                actor_email=user["email"],
+                action="devops_unlinked_local",
+                details=(
+                    f"Lokal DevOps-kobling til work item #{previous_work_item_id} ble fjernet "
+                    "uten sletting i Azure DevOps."
+                ),
+            )
+            _commit_with_retry(db, operation="Lokal frakobling fra DevOps")
+    except RuntimeError as exc:
+        return str(exc)
+    except Exception as exc:
+        return format_user_error(
+            "Kunne ikke frakoble DevOps-lenke lokalt",
+            exc,
+            fallback="Prøv igjen.",
+        )
+
+    _clear_bug_cache()
+    return None
+
+
 _SLA_DEFAULT_HOURS: dict[str, int] = {
     "critical": 8,
     "high": 24,
     "medium": 72,
     "low": 168,
 }
-
-
-def _truthy(value: str | None) -> bool:
-    return str(value or "").strip().casefold() in {"1", "true", "yes", "on"}
 
 
 def _load_sla_hours(*, force_refresh: bool = False) -> dict[str, int]:
@@ -2734,7 +4043,20 @@ def _render_admin_audit_log_panel() -> None:
         with right:
             action_filter = st.selectbox(
                 "Handling",
-                options=["all", "created", "updated", "comment_added", "status_changed", "soft_deleted", "restored"],
+                options=[
+                    "all",
+                    "created",
+                    "updated",
+                    "comment_added",
+                    "status_changed",
+                    "soft_deleted",
+                    "restored",
+                    "devops_synced",
+                    "devops_updated",
+                    "devops_pulled",
+                    "devops_removed",
+                    "devops_unlinked_local",
+                ],
                 key="admin_audit_action_filter",
                 format_func=lambda value: "Alle" if value == "all" else str(value),
             )
@@ -3189,6 +4511,140 @@ def _render_admin_access_management_sidebar(current_admin_email: str) -> None:
                 st.rerun()
 
 
+def _render_admin_devops_settings_sidebar(user: dict[str, str]) -> None:
+    with st.sidebar.expander("DevOps-innstillinger", expanded=False):
+        settings_payload = _load_devops_settings()
+        manage_allowed, manage_reason = _devops_admin_manage_access_state(user)
+        integration_allowed, integration_reason = _devops_access_state(user)
+        if not manage_allowed:
+            st.warning(manage_reason)
+        elif not integration_allowed:
+            st.info(integration_reason)
+            st.caption("Aktiver integrasjonen med bryteren under.")
+
+        st.caption("Kilde for verdier: override fra Admin vinner over secrets.toml.")
+        enabled_default = bool(settings_payload.get("resolved_enabled", False))
+        enabled_source = str(settings_payload.get("enabled_source", "config") or "config")
+        devops_enabled_toggle = st.toggle(
+            "Aktiver DevOps-integrasjon i UI",
+            value=enabled_default,
+            key="admin_devops_enabled",
+            disabled=not manage_allowed,
+            help="Styrer om 'Send bugen til DevOps' er aktiv i Assignee/Admin.",
+        )
+        st.caption(f"Integrasjon: {'på' if enabled_default else 'av'} (kilde: {enabled_source})")
+        st.caption(
+            "Org: "
+            f"{settings_payload.get('org_source', 'unset')} | "
+            "Prosjekt: "
+            f"{settings_payload.get('project_source', 'unset')} | "
+            "PAT: "
+            f"{settings_payload.get('pat_source', 'unset')} | "
+            "Type: "
+            f"{settings_payload.get('work_item_type_source', 'default')}"
+        )
+
+        org_default = str(settings_payload.get("override_org") or settings_payload.get("resolved_org") or "").strip()
+        project_default = str(settings_payload.get("override_project") or settings_payload.get("resolved_project") or "").strip()
+        org_input = st.text_input(
+            "Azure DevOps org",
+            value=org_default,
+            key="admin_devops_org",
+            disabled=not manage_allowed,
+        )
+        project_input = st.text_input(
+            "Azure DevOps prosjekt",
+            value=project_default,
+            key="admin_devops_project",
+            disabled=not manage_allowed,
+        )
+        work_item_type_default = str(
+            settings_payload.get("override_work_item_type")
+            or settings_payload.get("resolved_work_item_type")
+            or "Task"
+        ).strip() or "Task"
+        work_item_type_input = st.text_input(
+            "Work item type (f.eks. auto, Bug, Issue, Task)",
+            value=work_item_type_default,
+            key="admin_devops_work_item_type",
+            disabled=not manage_allowed,
+            help="Bruk 'Task' (samme som opprinnelig løsning) eller 'auto' for automatisk valg.",
+        )
+        st.caption(
+            "Aktiv PAT: "
+            + (
+                _mask_secret(str(settings_payload.get("resolved_pat") or ""))
+                if str(settings_payload.get("resolved_pat") or "").strip()
+                else "-"
+            )
+        )
+        pat_input = st.text_input(
+            "Azure DevOps PAT (skriv kun ved endring)",
+            value="",
+            type="password",
+            key="admin_devops_pat",
+            disabled=not manage_allowed,
+        )
+        keep_pat = st.checkbox(
+            "Behold eksisterende PAT når feltet over er tomt",
+            value=True,
+            key="admin_devops_keep_pat",
+            disabled=not manage_allowed,
+        )
+
+        c1, c2 = st.columns(2)
+        with c1:
+            save_clicked = st.button(
+                "Lagre DevOps-oppsett",
+                key="admin_devops_save",
+                use_container_width=True,
+                disabled=not manage_allowed,
+            )
+        with c2:
+            reset_clicked = st.button(
+                "Nullstill til secrets",
+                key="admin_devops_reset",
+                use_container_width=True,
+                disabled=not manage_allowed,
+            )
+
+        if save_clicked:
+            save_error = _save_devops_settings(
+                user,
+                enabled=bool(devops_enabled_toggle),
+                org=org_input,
+                project=project_input,
+                pat=pat_input,
+                work_item_type=work_item_type_input,
+                keep_existing_pat=bool(keep_pat),
+            )
+            if save_error:
+                st.error(save_error)
+            else:
+                st.success("DevOps-innstillinger lagret.")
+                st.rerun()
+
+        if reset_clicked:
+            reset_error = _reset_devops_settings(user)
+            if reset_error:
+                st.error(reset_error)
+            else:
+                st.success("DevOps-innstillinger er nullstilt til secrets.")
+                st.rerun()
+
+        if st.button(
+            "Test DevOps-tilkobling",
+            key="admin_devops_test",
+            use_container_width=True,
+            disabled=not manage_allowed,
+        ):
+            ok, detail = _test_devops_settings(user)
+            if ok:
+                st.success(detail)
+            else:
+                st.error(detail)
+
+
 def _recover_orphan_background_jobs() -> None:
     with db_session() as db:
         orphaned = (
@@ -3205,6 +4661,50 @@ def _recover_orphan_background_jobs() -> None:
                 row.error_message = "Job avbrutt fordi appen ble restartet før fullføring."
             row.finished_at = finished_at
         _commit_with_retry(db, operation="Oppdatering av bakgrunnsjobber")
+
+
+def _resolve_test_login_settings() -> tuple[bool, str, str]:
+    enabled = _is_truthy(_config_value("CLOUD_TEST_ENABLE_TEST_LOGIN", "true"))
+    email = _normalize_email(_config_value("CLOUD_TEST_LOCAL_TEST_EMAIL", "admin@example.com"))
+    password = _config_value("CLOUD_TEST_LOCAL_TEST_PASSWORD", "admin123")
+    return enabled, email, password
+
+
+def _upsert_test_login_user(
+    *,
+    email: str,
+    password: str,
+    force_password_refresh: bool = False,
+    create_operation: str,
+    update_operation: str,
+) -> None:
+    with db_session() as db:
+        user = db.get(User, email)
+        if user is None:
+            db.add(
+                User(
+                    email=email,
+                    full_name="Local Test Admin",
+                    password_hash=get_password_hash(password),
+                    role="admin",
+                    auth_provider="local",
+                )
+            )
+            _commit_with_retry(db, operation=create_operation)
+            return
+
+        changed = False
+        if str(user.role or "").strip().casefold() != "admin":
+            user.role = "admin"
+            changed = True
+        if str(user.auth_provider or "").strip().casefold() != "local":
+            user.auth_provider = "local"
+            changed = True
+        if force_password_refresh or not verify_password(password, str(user.password_hash or "")):
+            user.password_hash = get_password_hash(password)
+            changed = True
+        if changed:
+            _commit_with_retry(db, operation=update_operation)
 
 
 @st.cache_resource
@@ -3228,32 +4728,15 @@ def _init_local_data() -> bool:
         run_local_schema_upgrades()
 
     _recover_orphan_background_jobs()
-    enable_test_login = str(_config_value("CLOUD_TEST_ENABLE_TEST_LOGIN", "true")).strip().casefold() in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }
-    test_login_email = _normalize_email(_config_value("CLOUD_TEST_LOCAL_TEST_EMAIL", "admin@example.com"))
-    test_login_password = _config_value("CLOUD_TEST_LOCAL_TEST_PASSWORD", "admin123")
+    enable_test_login, test_login_email, test_login_password = _resolve_test_login_settings()
     if enable_test_login and _is_valid_email(test_login_email) and test_login_password:
-        with db_session() as db:
-            test_user = db.get(User, test_login_email)
-            if test_user:
-                test_user.role = "admin"
-                test_user.auth_provider = "local"
-                test_user.password_hash = get_password_hash(test_login_password)
-            else:
-                db.add(
-                    User(
-                        email=test_login_email,
-                        full_name="Local Test Admin",
-                        password_hash=get_password_hash(test_login_password),
-                        role="admin",
-                        auth_provider="local",
-                    )
-                )
-            _commit_with_retry(db, operation="Oppretting av lokal test-innlogging")
+        _upsert_test_login_user(
+            email=test_login_email,
+            password=test_login_password,
+            force_password_refresh=True,
+            create_operation="Oppretting av lokal test-innlogging",
+            update_operation="Oppdatering av lokal test-innlogging",
+        )
 
     if not _allow_local_login():
         return True
@@ -3318,8 +4801,1319 @@ def _get_or_create_user(db, *, email: str, role: str) -> User:
     return user
 
 
-def _write_history(db, *, bug_id: int, actor_email: str, action: str, details: str) -> None:
-    db.add(BugHistory(bug_id=bug_id, action=action, details=details, actor_email=actor_email))
+def _write_history(db, *, bug_id: int, actor_email: str, action: str, details: str) -> BugHistory:
+    row = BugHistory(bug_id=bug_id, action=action, details=details, actor_email=actor_email)
+    db.add(row)
+    return row
+
+
+def _notification_payload_text(payload: Mapping[str, Any] | None) -> str | None:
+    if not payload:
+        return None
+    try:
+        return json.dumps(dict(payload), ensure_ascii=False)[:4000]
+    except Exception:
+        return None
+
+
+def _notification_payload_dict(payload_text: str | None) -> dict[str, Any] | None:
+    if not str(payload_text or "").strip():
+        return None
+    try:
+        parsed = json.loads(str(payload_text))
+    except Exception:
+        return None
+    if isinstance(parsed, dict):
+        return parsed
+    return None
+
+
+def _notification_dedupe_key(
+    *,
+    event_type: str,
+    recipient_email: str,
+    bug_id: int | None,
+    history_id: int | None = None,
+    comment_id: int | None = None,
+    suffix: str | None = None,
+) -> str:
+    parts = [
+        str(event_type or "").strip().casefold(),
+        str(_normalize_email(recipient_email)),
+        str(int(bug_id or 0)),
+        str(int(history_id or 0)),
+        str(int(comment_id or 0)),
+        str(suffix or "").strip().casefold(),
+    ]
+    return ":".join(parts)[:255]
+
+
+def _notifications_enabled_for_user(user: dict[str, str] | None) -> bool:
+    return bool(user) and _is_entra_session(user)
+
+
+def _notification_email_settings() -> dict[str, Any]:
+    host = str(_config_value("SMTP_HOST", "") or "").strip()
+    sender = str(_config_value("SMTP_FROM", "") or "").strip()
+    username = str(_config_value("SMTP_USERNAME", "") or "").strip()
+    password = str(_config_value("SMTP_PASSWORD", "") or "").strip()
+    enabled_raw = str(_config_value("NOTIFY_EMAIL_ENABLED", "") or "").strip().casefold()
+    use_ssl_raw = str(_config_value("SMTP_USE_SSL", "false") or "false").strip().casefold()
+    use_tls_raw = str(_config_value("SMTP_USE_TLS", "true") or "true").strip().casefold()
+    auth_method_raw = str(_config_value("SMTP_AUTH_METHOD", "auto") or "auto").strip().casefold()
+    oauth2_enabled_raw = str(_config_value("SMTP_OAUTH2_ENABLED", "") or "").strip().casefold()
+    oauth2_tenant_id = str(_config_value("SMTP_OAUTH2_TENANT_ID", "") or "").strip()
+    oauth2_client_id = str(_config_value("SMTP_OAUTH2_CLIENT_ID", "") or "").strip()
+    oauth2_client_secret = str(_config_value("SMTP_OAUTH2_CLIENT_SECRET", "") or "").strip()
+    oauth2_scope = str(_config_value("SMTP_OAUTH2_SCOPE", "https://outlook.office365.com/.default") or "").strip()
+    oauth2_token_url = str(_config_value("SMTP_OAUTH2_TOKEN_URL", "") or "").strip()
+    oauth2_username = str(_config_value("SMTP_OAUTH2_USERNAME", username or sender) or "").strip()
+
+    # Optional fallback to existing Streamlit OIDC settings for quick setup.
+    if not oauth2_client_id or not oauth2_client_secret or not oauth2_tenant_id:
+        try:
+            auth_cfg = st.secrets.get("auth", {})
+            if isinstance(auth_cfg, Mapping):
+                microsoft_cfg = auth_cfg.get("microsoft", {})
+                if isinstance(microsoft_cfg, Mapping):
+                    if not oauth2_client_id:
+                        oauth2_client_id = str(microsoft_cfg.get("client_id", "") or "").strip()
+                    if not oauth2_client_secret:
+                        oauth2_client_secret = str(microsoft_cfg.get("client_secret", "") or "").strip()
+                    if not oauth2_tenant_id:
+                        metadata_url = str(microsoft_cfg.get("server_metadata_url", "") or "").strip()
+                        match = re.search(r"login\.microsoftonline\.com/([^/]+)/", metadata_url, flags=re.IGNORECASE)
+                        if match:
+                            oauth2_tenant_id = str(match.group(1) or "").strip()
+        except Exception:
+            pass
+
+    def _as_bool(value: str, *, default: bool = False) -> bool:
+        return _is_truthy(value, default=default)
+
+    try:
+        port = int(str(_config_value("SMTP_PORT", "587") or "587").strip())
+    except (TypeError, ValueError):
+        port = 587
+    port = max(1, min(65535, int(port)))
+
+    try:
+        timeout_seconds = float(str(_config_value("SMTP_TIMEOUT_SECONDS", "12") or "12").strip())
+    except (TypeError, ValueError):
+        timeout_seconds = 12.0
+    timeout_seconds = max(2.0, min(60.0, timeout_seconds))
+
+    enabled = _as_bool(enabled_raw, default=False)
+    if enabled_raw == "":
+        enabled = bool(host and sender)
+
+    oauth2_enabled = _as_bool(oauth2_enabled_raw, default=False)
+    if auth_method_raw in {"oauth2", "xoauth2"}:
+        oauth2_enabled = True
+
+    auth_method = "basic"
+    if auth_method_raw in {"oauth2", "xoauth2"}:
+        auth_method = "oauth2"
+    elif auth_method_raw in {"basic", "login", "password"}:
+        auth_method = "basic"
+    elif oauth2_enabled:
+        auth_method = "oauth2"
+
+    use_ssl = _as_bool(use_ssl_raw, default=False)
+    use_tls = _as_bool(use_tls_raw, default=not use_ssl)
+    if use_ssl:
+        use_tls = False
+
+    oauth2_ready = bool(
+        oauth2_enabled
+        and oauth2_client_id
+        and oauth2_client_secret
+        and oauth2_scope
+        and oauth2_username
+        and (oauth2_token_url or oauth2_tenant_id)
+    )
+    basic_ready = bool(not username or password)
+    effective_enabled = enabled and bool(host and sender)
+    if auth_method == "oauth2":
+        effective_enabled = effective_enabled and oauth2_ready
+    else:
+        effective_enabled = effective_enabled and basic_ready
+
+    return {
+        "enabled": effective_enabled,
+        "host": host,
+        "port": port,
+        "sender": sender,
+        "username": username,
+        "password": password,
+        "use_ssl": use_ssl,
+        "use_tls": use_tls,
+        "timeout_seconds": timeout_seconds,
+        "auth_method": auth_method,
+        "oauth2_enabled": oauth2_enabled,
+        "oauth2_ready": oauth2_ready,
+        "oauth2_tenant_id": oauth2_tenant_id,
+        "oauth2_client_id": oauth2_client_id,
+        "oauth2_client_secret": oauth2_client_secret,
+        "oauth2_scope": oauth2_scope,
+        "oauth2_token_url": oauth2_token_url,
+        "oauth2_username": oauth2_username,
+    }
+
+
+def _notification_email_enabled() -> bool:
+    return bool(_notification_email_settings().get("enabled"))
+
+
+def _notification_outbox_channels() -> list[str]:
+    channels = ["in_app"]
+    if _notification_email_enabled():
+        channels.append("email")
+    return channels
+
+
+def _queue_notification_outbox_event_single(
+    db,
+    *,
+    recipient_email: str,
+    event_type: str,
+    bug_id: int | None,
+    title: str,
+    message: str,
+    actor_email: str | None,
+    dedupe_key: str,
+    payload: Mapping[str, Any] | None = None,
+    channel: str,
+) -> None:
+    normalized_channel = str(channel or "").strip().casefold()
+    if normalized_channel not in {"in_app", "email"}:
+        return
+
+    normalized_recipient = _normalize_email(recipient_email)
+    if not normalized_recipient or not _is_valid_email(normalized_recipient):
+        return
+    dedupe = str(dedupe_key or "").strip()[:255]
+    if not dedupe:
+        return
+    for pending in list(getattr(db, "new", set())):
+        if isinstance(pending, NotificationOutboxEvent) and str(getattr(pending, "dedupe_key", "")) == dedupe:
+            return
+    existing = db.scalar(select(NotificationOutboxEvent.id).where(NotificationOutboxEvent.dedupe_key == dedupe).limit(1))
+    if existing is not None:
+        return
+
+    payload_text = _notification_payload_text(payload)
+    db.add(
+        NotificationOutboxEvent(
+            recipient_email=normalized_recipient,
+            event_type=str(event_type or "event").strip()[:80],
+            bug_id=int(bug_id) if bug_id else None,
+            title=str(title or "Varsel").strip()[:255],
+            message=str(message or "").strip()[:2000],
+            payload_json=payload_text,
+            dedupe_key=dedupe,
+            actor_email=_normalize_email(actor_email) if actor_email else None,
+            channel=normalized_channel,
+            status="pending",
+            attempts=0,
+        )
+    )
+
+
+def _queue_notification_outbox_event(
+    db,
+    *,
+    recipient_email: str,
+    event_type: str,
+    bug_id: int | None,
+    title: str,
+    message: str,
+    actor_email: str | None,
+    dedupe_key: str,
+    payload: Mapping[str, Any] | None = None,
+    channel: str = "auto",
+) -> None:
+    normalized_channel = str(channel or "auto").strip().casefold()
+    if normalized_channel in {"in_app", "email"}:
+        target_channels = [normalized_channel]
+    else:
+        target_channels = _notification_outbox_channels()
+    dedupe_base = str(dedupe_key or "").strip()
+    if not dedupe_base:
+        return
+    for target_channel in target_channels:
+        _queue_notification_outbox_event_single(
+            db,
+            recipient_email=recipient_email,
+            event_type=event_type,
+            bug_id=bug_id,
+            title=title,
+            message=message,
+            actor_email=actor_email,
+            dedupe_key=f"{dedupe_base}:{target_channel}",
+            payload=payload,
+            channel=target_channel,
+        )
+
+
+def _queue_in_app_notification(
+    db,
+    *,
+    recipient_email: str,
+    event_type: str,
+    bug_id: int | None,
+    title: str,
+    message: str,
+    actor_email: str | None,
+    dedupe_key: str,
+    payload: Mapping[str, Any] | None = None,
+) -> None:
+    normalized_recipient = _normalize_email(recipient_email)
+    if not normalized_recipient or not _is_valid_email(normalized_recipient):
+        return
+    dedupe = str(dedupe_key or "").strip()[:255]
+    if not dedupe:
+        return
+    for pending in list(getattr(db, "new", set())):
+        if isinstance(pending, InAppNotification) and str(getattr(pending, "dedupe_key", "")) == dedupe:
+            return
+    existing = db.scalar(select(InAppNotification.id).where(InAppNotification.dedupe_key == dedupe).limit(1))
+    if existing is not None:
+        return
+
+    payload_text = _notification_payload_text(payload)
+    row = InAppNotification(
+        recipient_email=normalized_recipient,
+        event_type=str(event_type or "event").strip()[:80],
+        bug_id=int(bug_id) if bug_id else None,
+        title=str(title or "Varsel").strip()[:255],
+        message=str(message or "").strip()[:2000],
+        payload_json=payload_text,
+        dedupe_key=dedupe,
+        actor_email=_normalize_email(actor_email) if actor_email else None,
+    )
+    db.add(row)
+
+
+def _build_notification_email_body(row: NotificationOutboxEvent) -> str:
+    lines = [
+        str(row.message or "").strip(),
+        "",
+        f"Hendelse: {str(row.event_type or '-').strip()}",
+        f"Bug: #{int(row.bug_id)}" if row.bug_id is not None else "Bug: -",
+    ]
+    actor = str(row.actor_email or "").strip()
+    if actor:
+        lines.append(f"Utført av: {actor}")
+    created = format_datetime_display(row.created_at) if getattr(row, "created_at", None) else ""
+    if created:
+        lines.append(f"Tidspunkt: {created}")
+    return "\n".join(lines).strip()
+
+
+def _resolve_smtp_oauth2_token_url(settings_payload: Mapping[str, Any]) -> str:
+    explicit = str(settings_payload.get("oauth2_token_url") or "").strip()
+    if explicit:
+        return explicit
+    tenant = str(settings_payload.get("oauth2_tenant_id") or "").strip()
+    if not tenant:
+        raise RuntimeError("SMTP OAuth2 mangler tenant-id eller token-url.")
+    return f"https://login.microsoftonline.com/{tenant}/oauth2/v2.0/token"
+
+
+def _fetch_smtp_oauth2_access_token(settings_payload: Mapping[str, Any]) -> str:
+    token_url = _resolve_smtp_oauth2_token_url(settings_payload)
+    client_id = str(settings_payload.get("oauth2_client_id") or "").strip()
+    client_secret = str(settings_payload.get("oauth2_client_secret") or "").strip()
+    scope = str(settings_payload.get("oauth2_scope") or "").strip()
+    if not client_id or not client_secret or not scope:
+        raise RuntimeError("SMTP OAuth2 mangler client-id/client-secret/scope.")
+
+    cache_key = f"{token_url}|{client_id}|{scope}"
+    cached = _SMTP_OAUTH2_TOKEN_CACHE.get(cache_key)
+    now = time.time()
+    if cached and cached[1] - now > 90:
+        return str(cached[0])
+
+    body = urlencode(
+        {
+            "grant_type": "client_credentials",
+            "client_id": client_id,
+            "client_secret": client_secret,
+            "scope": scope,
+        }
+    ).encode("utf-8")
+    request = Request(
+        token_url,
+        data=body,
+        method="POST",
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+    )
+    try:
+        with urlopen(request, timeout=12) as response:
+            raw = response.read().decode("utf-8", errors="replace")
+    except HTTPError as exc:
+        details = ""
+        try:
+            details = exc.read().decode("utf-8", errors="replace")
+        except Exception:
+            details = str(exc)
+        raise RuntimeError(f"SMTP OAuth2 token-feil ({exc.code}): {details[:240]}") from exc
+    except URLError as exc:
+        raise RuntimeError(f"SMTP OAuth2 token-endepunkt utilgjengelig: {exc}") from exc
+
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("SMTP OAuth2 token-respons var ikke gyldig JSON.") from exc
+
+    access_token = str(payload.get("access_token") or "").strip()
+    if not access_token:
+        error_code = str(payload.get("error") or "").strip()
+        description = str(payload.get("error_description") or "").strip()
+        raise RuntimeError(
+            f"SMTP OAuth2 token mangler access_token ({error_code}: {description})".strip()
+        )
+
+    expires_in_raw = payload.get("expires_in", 3600)
+    try:
+        expires_in = max(120, int(expires_in_raw))
+    except (TypeError, ValueError):
+        expires_in = 3600
+    _SMTP_OAUTH2_TOKEN_CACHE[cache_key] = (access_token, now + expires_in)
+    return access_token
+
+
+def _smtp_auth_xoauth2(smtp: smtplib.SMTP, *, username: str, access_token: str) -> None:
+    user_value = str(username or "").strip()
+    token_value = str(access_token or "").strip()
+    if not user_value or not token_value:
+        raise RuntimeError("SMTP OAuth2 mangler brukernavn eller access-token.")
+    auth_string = f"user={user_value}\x01auth=Bearer {token_value}\x01\x01"
+    auth_b64 = base64.b64encode(auth_string.encode("utf-8")).decode("ascii")
+    code, response = smtp.docmd("AUTH", f"XOAUTH2 {auth_b64}")
+    if int(code) not in {235, 250}:
+        response_text = (
+            response.decode("utf-8", errors="replace")
+            if isinstance(response, (bytes, bytearray))
+            else str(response or "")
+        )
+        raise RuntimeError(f"SMTP OAuth2 autentisering feilet ({code}): {response_text[:240]}")
+
+
+def _decode_jwt_payload_unverified(token: str) -> dict[str, Any] | None:
+    raw = str(token or "").strip()
+    if not raw or "." not in raw:
+        return None
+    parts = raw.split(".")
+    if len(parts) < 2:
+        return None
+    payload_part = parts[1]
+    if not payload_part:
+        return None
+    padding = "=" * (-len(payload_part) % 4)
+    try:
+        decoded = base64.urlsafe_b64decode(f"{payload_part}{padding}".encode("ascii"))
+        parsed = json.loads(decoded.decode("utf-8", errors="replace"))
+    except Exception:
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _format_diag_timestamp(value: Any) -> str:
+    try:
+        timestamp = int(value)
+        if timestamp <= 0:
+            return "-"
+        return format_datetime_display(datetime.fromtimestamp(timestamp, tz=timezone.utc))
+    except Exception:
+        return "-"
+
+
+def _mask_text(value: str, *, keep_prefix: int = 5, keep_suffix: int = 3) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return "-"
+    if len(text) <= keep_prefix + keep_suffix + 2:
+        return "*" * len(text)
+    return f"{text[:keep_prefix]}...{text[-keep_suffix:]}"
+
+
+def _run_smtp_oauth2_diagnostic() -> dict[str, Any]:
+    settings_payload = _notification_email_settings()
+    results: list[dict[str, str]] = []
+
+    def _add(status: str, title: str, detail: str) -> None:
+        results.append(
+            {
+                "status": str(status or "info").strip().casefold(),
+                "title": str(title or "").strip(),
+                "detail": str(detail or "").strip(),
+            }
+        )
+
+    _add(
+        "info",
+        "Varselkanal",
+        "E-post aktivert." if bool(settings_payload.get("enabled")) else "E-post er ikke aktivert i konfigurasjon.",
+    )
+    _add(
+        "info",
+        "SMTP-endepunkt",
+        f"{settings_payload.get('host') or '-'}:{settings_payload.get('port') or '-'} "
+        f"(TLS={'på' if settings_payload.get('use_tls') else 'av'}, SSL={'på' if settings_payload.get('use_ssl') else 'av'})",
+    )
+
+    auth_method = str(settings_payload.get("auth_method") or "basic").strip().casefold()
+    if auth_method != "oauth2":
+        _add("warn", "Autentiseringsmetode", f"Står til '{auth_method}'. Sett SMTP_AUTH_METHOD='oauth2'.")
+    else:
+        _add("ok", "Autentiseringsmetode", "OAuth2/XOAUTH2 er valgt.")
+
+    if bool(settings_payload.get("oauth2_ready")):
+        _add("ok", "OAuth2-konfig", "Client/Tenant/Scope/bruker ser komplett ut.")
+    else:
+        missing = []
+        if not str(settings_payload.get("oauth2_client_id") or "").strip():
+            missing.append("client_id")
+        if not str(settings_payload.get("oauth2_client_secret") or "").strip():
+            missing.append("client_secret")
+        if not str(settings_payload.get("oauth2_scope") or "").strip():
+            missing.append("scope")
+        if not str(settings_payload.get("oauth2_username") or "").strip():
+            missing.append("username")
+        if not (
+            str(settings_payload.get("oauth2_token_url") or "").strip()
+            or str(settings_payload.get("oauth2_tenant_id") or "").strip()
+        ):
+            missing.append("tenant_id/token_url")
+        missing_text = ", ".join(missing) if missing else "ukjent"
+        _add("fail", "OAuth2-konfig", f"Mangler felter: {missing_text}.")
+
+    token_claims: dict[str, Any] | None = None
+    access_token = ""
+    token_fetch_error = ""
+    if auth_method == "oauth2":
+        try:
+            access_token = _fetch_smtp_oauth2_access_token(settings_payload)
+            _add("ok", "Token-henting", "Access token ble hentet fra Entra.")
+        except Exception as exc:
+            token_fetch_error = str(exc).strip()
+            _add("fail", "Token-henting", token_fetch_error or "Ukjent feil ved token-henting.")
+
+    if access_token:
+        token_claims = _decode_jwt_payload_unverified(access_token)
+        if token_claims:
+            audience = str(token_claims.get("aud") or "").strip()
+            if audience.casefold() == "https://outlook.office365.com":
+                _add("ok", "Token audience", audience)
+            else:
+                _add(
+                    "warn",
+                    "Token audience",
+                    f"{audience or '-'} (for SMTP anbefales https://outlook.office365.com)",
+                )
+            _add("info", "Token issuer", str(token_claims.get("iss") or "-").strip())
+            _add("info", "Token expiry (UTC)", _format_diag_timestamp(token_claims.get("exp")))
+            _add(
+                "info",
+                "Token app-id",
+                str(token_claims.get("appid") or token_claims.get("azp") or "-").strip(),
+            )
+        else:
+            _add("warn", "Token claims", "Kunne ikke dekode JWT payload.")
+
+    smtp_probe_error = ""
+    smtp_auth_attempted = False
+    smtp_host = str(settings_payload.get("host") or "").strip()
+    smtp_port = int(settings_payload.get("port") or 587)
+    smtp_timeout = float(settings_payload.get("timeout_seconds") or 12.0)
+    smtp_use_ssl = bool(settings_payload.get("use_ssl"))
+    smtp_use_tls = bool(settings_payload.get("use_tls"))
+    smtp_username = str(settings_payload.get("oauth2_username") or settings_payload.get("username") or "").strip()
+
+    if smtp_host and access_token and auth_method == "oauth2":
+        smtp_client: smtplib.SMTP | None = None
+        try:
+            if smtp_use_ssl:
+                smtp_client = smtplib.SMTP_SSL(smtp_host, port=smtp_port, timeout=smtp_timeout)
+            else:
+                smtp_client = smtplib.SMTP(smtp_host, port=smtp_port, timeout=smtp_timeout)
+                smtp_client.ehlo()
+                if smtp_use_tls:
+                    smtp_client.starttls()
+                    smtp_client.ehlo()
+            capabilities = ""
+            try:
+                capabilities = str(getattr(smtp_client, "esmtp_features", {}).get("auth") or "").upper()
+            except Exception:
+                capabilities = ""
+            if "XOAUTH2" in capabilities:
+                _add("ok", "SMTP capabilities", f"AUTH annonserer XOAUTH2 ({capabilities}).")
+            elif capabilities:
+                _add("warn", "SMTP capabilities", f"AUTH annonserer: {capabilities}")
+            else:
+                _add("warn", "SMTP capabilities", "Ingen AUTH-capabilities lest ut.")
+
+            smtp_auth_attempted = True
+            _smtp_auth_xoauth2(smtp_client, username=smtp_username, access_token=access_token)
+            _add("ok", "SMTP XOAUTH2", "Autentisering mot SMTP lykkes.")
+        except Exception as exc:
+            smtp_probe_error = str(exc).strip()
+            _add("fail", "SMTP XOAUTH2", smtp_probe_error or "Ukjent SMTP-feil.")
+        finally:
+            try:
+                if smtp_client is not None:
+                    smtp_client.quit()
+            except Exception:
+                pass
+    elif auth_method == "oauth2" and not access_token:
+        _add("warn", "SMTP XOAUTH2", "Hoppe over SMTP-probe fordi token ikke ble hentet.")
+    elif auth_method == "oauth2":
+        _add("warn", "SMTP XOAUTH2", "Hoppe over SMTP-probe fordi SMTP host mangler.")
+
+    return {
+        "generated_at": format_datetime_display(datetime.now(timezone.utc)),
+        "results": results,
+        "summary": {
+            "auth_method": auth_method,
+            "email_enabled": bool(settings_payload.get("enabled")),
+            "oauth2_ready": bool(settings_payload.get("oauth2_ready")),
+            "smtp_host": smtp_host,
+            "smtp_port": smtp_port,
+            "smtp_use_tls": smtp_use_tls,
+            "smtp_use_ssl": smtp_use_ssl,
+            "oauth2_scope": str(settings_payload.get("oauth2_scope") or "").strip(),
+            "oauth2_tenant_id_masked": _mask_text(str(settings_payload.get("oauth2_tenant_id") or "").strip()),
+            "oauth2_client_id_masked": _mask_text(str(settings_payload.get("oauth2_client_id") or "").strip()),
+            "oauth2_username": smtp_username or "-",
+            "token_fetch_error": token_fetch_error,
+            "smtp_probe_error": smtp_probe_error,
+            "smtp_auth_attempted": smtp_auth_attempted,
+            "token_claims": token_claims or {},
+        },
+    }
+
+
+def _send_email_notification(row: NotificationOutboxEvent) -> None:
+    settings_payload = _notification_email_settings()
+    if not bool(settings_payload.get("enabled")):
+        raise RuntimeError("SMTP er ikke konfigurert/aktivert.")
+
+    recipient = str(row.recipient_email or "").strip()
+    if not _is_valid_email(recipient):
+        raise RuntimeError("Ugyldig mottakeradresse.")
+
+    sender = str(settings_payload.get("sender") or "").strip()
+    host = str(settings_payload.get("host") or "").strip()
+    if not sender or not host:
+        raise RuntimeError("SMTP mangler sender eller host.")
+
+    subject = str(row.title or "Varsel fra bugsystem").strip()[:255] or "Varsel fra bugsystem"
+    body = _build_notification_email_body(row)
+
+    message = EmailMessage()
+    message["Subject"] = subject
+    message["From"] = sender
+    message["To"] = recipient
+    message.set_content(body)
+
+    username = str(settings_payload.get("username") or "").strip()
+    password = str(settings_payload.get("password") or "").strip()
+    auth_method = str(settings_payload.get("auth_method") or "basic").strip().casefold()
+    oauth2_username = str(settings_payload.get("oauth2_username") or username or sender).strip()
+    port = int(settings_payload.get("port") or 587)
+    timeout_seconds = float(settings_payload.get("timeout_seconds") or 12.0)
+    use_ssl = bool(settings_payload.get("use_ssl"))
+    use_tls = bool(settings_payload.get("use_tls"))
+
+    oauth2_token: str | None = None
+    if auth_method == "oauth2":
+        oauth2_token = _fetch_smtp_oauth2_access_token(settings_payload)
+
+    if use_ssl:
+        with smtplib.SMTP_SSL(host, port=port, timeout=timeout_seconds) as smtp:
+            if auth_method == "oauth2":
+                _smtp_auth_xoauth2(smtp, username=oauth2_username, access_token=str(oauth2_token or ""))
+            elif username:
+                smtp.login(username, password)
+            smtp.send_message(message)
+        return
+
+    with smtplib.SMTP(host, port=port, timeout=timeout_seconds) as smtp:
+        smtp.ehlo()
+        if use_tls:
+            smtp.starttls()
+            smtp.ehlo()
+        if auth_method == "oauth2":
+            _smtp_auth_xoauth2(smtp, username=oauth2_username, access_token=str(oauth2_token or ""))
+        elif username:
+            smtp.login(username, password)
+        smtp.send_message(message)
+
+
+def _dispatch_notification_outbox(db, *, max_items: int = 200) -> None:
+    db.flush()
+    pending_rows = list(
+        db.scalars(
+            select(NotificationOutboxEvent)
+            .where(NotificationOutboxEvent.status == "pending")
+            .order_by(NotificationOutboxEvent.created_at.asc(), NotificationOutboxEvent.id.asc())
+            .limit(max(1, min(1000, int(max_items))))
+        ).all()
+    )
+    if not pending_rows:
+        return
+
+    max_attempts_raw = str(_config_value("NOTIFY_MAX_ATTEMPTS", "3") or "3").strip()
+    try:
+        max_attempts = int(max_attempts_raw)
+    except (TypeError, ValueError):
+        max_attempts = 3
+    max_attempts = max(1, min(10, max_attempts))
+
+    now = datetime.now(timezone.utc)
+    for row in pending_rows:
+        row.attempts = int(row.attempts or 0) + 1
+        row.updated_at = now
+        try:
+            channel = str(row.channel or "").strip().casefold()
+            if channel == "in_app":
+                _queue_in_app_notification(
+                    db,
+                    recipient_email=str(row.recipient_email or ""),
+                    event_type=str(row.event_type or "event"),
+                    bug_id=int(row.bug_id) if row.bug_id is not None else None,
+                    title=str(row.title or "Varsel"),
+                    message=str(row.message or ""),
+                    actor_email=str(row.actor_email or "") or None,
+                    dedupe_key=str(row.dedupe_key or ""),
+                    payload=_notification_payload_dict(row.payload_json),
+                )
+            elif channel == "email":
+                _send_email_notification(row)
+            else:
+                row.status = "failed"
+                row.last_error = f"Unsupported channel: {row.channel}"
+                continue
+            row.status = "delivered"
+            row.delivered_at = now
+            row.last_error = None
+        except Exception as exc:
+            row.last_error = f"{exc.__class__.__name__}: {exc}"[:2000]
+            if int(row.attempts or 0) >= max_attempts:
+                row.status = "failed"
+            else:
+                row.status = "pending"
+
+
+def _admin_notification_recipients() -> set[str]:
+    return {
+        _normalize_email(item)
+        for item in (_admin_emails() | _db_admin_emails())
+        if _is_valid_email(_normalize_email(item))
+    }
+
+
+def _emit_notifications_for_bug_created(
+    db,
+    *,
+    bug: Bug,
+    actor_email: str,
+    history_id: int | None,
+    notifications_enabled: bool = True,
+) -> None:
+    if not notifications_enabled:
+        return
+    actor_norm = _normalize_email(actor_email)
+    bug_id = int(bug.id)
+    bug_title = str(bug.title or f"Bug #{bug_id}")
+    assignee_norm = _normalize_email(bug.assignee_id)
+
+    if assignee_norm:
+        _queue_notification_outbox_event(
+            db,
+            recipient_email=assignee_norm,
+            event_type="bug_assigned",
+            bug_id=bug_id,
+            title=f"Ny tildeling: bug #{bug_id}",
+            message=f"Du er tildelt «{bug_title}».",
+            actor_email=actor_email,
+            dedupe_key=_notification_dedupe_key(
+                event_type="bug_assigned",
+                recipient_email=assignee_norm,
+                bug_id=bug_id,
+                history_id=history_id,
+                suffix="created",
+            ),
+            payload={"status": normalize_bug_status(bug.status), "severity": str(bug.severity or "")},
+        )
+
+    if str(bug.severity or "").strip().casefold() == "critical":
+        for admin_email in _admin_notification_recipients():
+            if admin_email == actor_norm:
+                continue
+            _queue_notification_outbox_event(
+                db,
+                recipient_email=admin_email,
+                event_type="bug_critical",
+                bug_id=bug_id,
+                title=f"Kritisk bug opprettet #{bug_id}",
+                message=f"Kritisk bug opprettet: «{bug_title}».",
+                actor_email=actor_email,
+                dedupe_key=_notification_dedupe_key(
+                    event_type="bug_critical",
+                    recipient_email=admin_email,
+                    bug_id=bug_id,
+                    history_id=history_id,
+                    suffix="created",
+                ),
+                payload={"status": normalize_bug_status(bug.status), "severity": str(bug.severity or "")},
+            )
+
+
+def _emit_notifications_for_comment(
+    db,
+    *,
+    bug: Bug,
+    actor_email: str,
+    comment_id: int | None,
+    comment_body: str,
+    notifications_enabled: bool = True,
+) -> None:
+    if not notifications_enabled:
+        return
+    actor_norm = _normalize_email(actor_email)
+    bug_id = int(bug.id)
+    bug_title = str(bug.title or f"Bug #{bug_id}")
+    reporter_norm = _normalize_email(bug.reporter_id)
+    assignee_norm = _normalize_email(bug.assignee_id)
+    recipients = {
+        recipient
+        for recipient in {reporter_norm, assignee_norm}
+        if recipient and recipient != actor_norm
+    }
+    if not recipients:
+        return
+
+    preview = str(comment_body or "").strip().replace("\n", " ")
+    if len(preview) > 140:
+        preview = f"{preview[:137]}..."
+
+    for recipient in recipients:
+        _queue_notification_outbox_event(
+            db,
+            recipient_email=recipient,
+            event_type="bug_comment_added",
+            bug_id=bug_id,
+            title=f"Ny kommentar på bug #{bug_id}",
+            message=f"{actor_email} kommenterte «{bug_title}». {preview}",
+            actor_email=actor_email,
+            dedupe_key=_notification_dedupe_key(
+                event_type="bug_comment_added",
+                recipient_email=recipient,
+                bug_id=bug_id,
+                comment_id=comment_id,
+            ),
+            payload={"comment_id": int(comment_id or 0), "status": normalize_bug_status(bug.status)},
+        )
+
+
+def _emit_notifications_for_update(
+    db,
+    *,
+    bug: Bug,
+    actor_email: str,
+    history_id: int | None,
+    previous_status: str,
+    previous_assignee: str | None,
+    previous_severity: str,
+    previous_overdue: bool,
+    new_status: str,
+    new_assignee: str | None,
+    new_severity: str,
+    new_overdue: bool,
+    notifications_enabled: bool = True,
+) -> None:
+    if not notifications_enabled:
+        return
+    actor_norm = _normalize_email(actor_email)
+    bug_id = int(bug.id)
+    bug_title = str(bug.title or f"Bug #{bug_id}")
+    reporter_norm = _normalize_email(bug.reporter_id)
+    previous_assignee_norm = _normalize_email(previous_assignee)
+    new_assignee_norm = _normalize_email(new_assignee)
+
+    assignee_changed = previous_assignee_norm != new_assignee_norm
+    status_changed = previous_status != new_status
+    severity_escalated_to_critical = previous_severity != "critical" and new_severity == "critical"
+
+    if assignee_changed:
+        if new_assignee_norm:
+            _queue_notification_outbox_event(
+                db,
+                recipient_email=new_assignee_norm,
+                event_type="bug_assigned",
+                bug_id=bug_id,
+                title=f"Ny tildeling: bug #{bug_id}",
+                message=f"Du er tildelt «{bug_title}».",
+                actor_email=actor_email,
+                dedupe_key=_notification_dedupe_key(
+                    event_type="bug_assigned",
+                    recipient_email=new_assignee_norm,
+                    bug_id=bug_id,
+                    history_id=history_id,
+                    suffix=f"to:{new_assignee_norm}",
+                ),
+                payload={"status": new_status, "severity": new_severity},
+            )
+        if previous_assignee_norm and previous_assignee_norm != actor_norm and previous_assignee_norm != new_assignee_norm:
+            _queue_notification_outbox_event(
+                db,
+                recipient_email=previous_assignee_norm,
+                event_type="bug_unassigned",
+                bug_id=bug_id,
+                title=f"Tildeling fjernet: bug #{bug_id}",
+                message=f"Du er ikke lenger tildelt «{bug_title}».",
+                actor_email=actor_email,
+                dedupe_key=_notification_dedupe_key(
+                    event_type="bug_unassigned",
+                    recipient_email=previous_assignee_norm,
+                    bug_id=bug_id,
+                    history_id=history_id,
+                    suffix=f"from:{previous_assignee_norm}",
+                ),
+                payload={"status": new_status, "severity": new_severity},
+            )
+        if reporter_norm and reporter_norm != actor_norm:
+            _queue_notification_outbox_event(
+                db,
+                recipient_email=reporter_norm,
+                event_type="bug_assignee_changed",
+                bug_id=bug_id,
+                title=f"Ny ansvarlig på bug #{bug_id}",
+                message=f"Ansvarlig endret til: {new_assignee_norm or 'ikke tildelt'}.",
+                actor_email=actor_email,
+                dedupe_key=_notification_dedupe_key(
+                    event_type="bug_assignee_changed",
+                    recipient_email=reporter_norm,
+                    bug_id=bug_id,
+                    history_id=history_id,
+                ),
+                payload={"status": new_status, "severity": new_severity},
+            )
+
+    if status_changed:
+        event_type = "bug_status_changed"
+        if new_status == "resolved":
+            event_type = "bug_resolved"
+        elif previous_status == "resolved" and new_status == "open":
+            event_type = "bug_reopened"
+
+        targets = {
+            recipient
+            for recipient in {reporter_norm, new_assignee_norm}
+            if recipient and recipient != actor_norm
+        }
+        status_text = status_label(new_status)
+        for recipient in targets:
+            _queue_notification_outbox_event(
+                db,
+                recipient_email=recipient,
+                event_type=event_type,
+                bug_id=bug_id,
+                title=f"Status endret på bug #{bug_id}",
+                message=f"Status for «{bug_title}» er nå {status_text}.",
+                actor_email=actor_email,
+                dedupe_key=_notification_dedupe_key(
+                    event_type=event_type,
+                    recipient_email=recipient,
+                    bug_id=bug_id,
+                    history_id=history_id,
+                    suffix=f"{previous_status}->{new_status}",
+                ),
+                payload={"status": new_status, "severity": new_severity},
+            )
+
+    if severity_escalated_to_critical:
+        for admin_email in _admin_notification_recipients():
+            if admin_email == actor_norm:
+                continue
+            _queue_notification_outbox_event(
+                db,
+                recipient_email=admin_email,
+                event_type="bug_critical",
+                bug_id=bug_id,
+                title=f"Kritisk bug: #{bug_id}",
+                message=f"Bug «{bug_title}» er satt til kritisk alvorlighet.",
+                actor_email=actor_email,
+                dedupe_key=_notification_dedupe_key(
+                    event_type="bug_critical",
+                    recipient_email=admin_email,
+                    bug_id=bug_id,
+                    history_id=history_id,
+                    suffix="severity",
+                ),
+                payload={"status": new_status, "severity": new_severity},
+            )
+
+    if new_status != "resolved" and new_overdue and not previous_overdue:
+        for admin_email in _admin_notification_recipients():
+            if admin_email == actor_norm:
+                continue
+            _queue_notification_outbox_event(
+                db,
+                recipient_email=admin_email,
+                event_type="bug_sla_overdue",
+                bug_id=bug_id,
+                title=f"SLA-brudd på bug #{bug_id}",
+                message=f"Bug «{bug_title}» har passert SLA-frist.",
+                actor_email=actor_email,
+                dedupe_key=_notification_dedupe_key(
+                    event_type="bug_sla_overdue",
+                    recipient_email=admin_email,
+                    bug_id=bug_id,
+                    history_id=history_id,
+                ),
+                payload={"status": new_status, "severity": new_severity},
+            )
+
+
+def _list_notifications_for_user(*, user_email: str, unread_only: bool, limit: int) -> list[InAppNotification]:
+    normalized = _normalize_email(user_email)
+    if not normalized:
+        return []
+    max_rows = max(1, min(100, int(limit)))
+    with db_session() as db:
+        query = (
+            select(InAppNotification)
+            .where(func.lower(InAppNotification.recipient_email) == normalized)
+            .order_by(InAppNotification.created_at.desc(), InAppNotification.id.desc())
+            .limit(max_rows)
+        )
+        if unread_only:
+            query = query.where(InAppNotification.is_read.is_(False))
+        return list(db.scalars(query).all())
+
+
+def _count_unread_notifications(user_email: str) -> int:
+    normalized = _normalize_email(user_email)
+    if not normalized:
+        return 0
+    with db_session() as db:
+        value = db.scalar(
+            select(func.count(InAppNotification.id)).where(
+                func.lower(InAppNotification.recipient_email) == normalized,
+                InAppNotification.is_read.is_(False),
+            )
+        )
+    return int(value or 0)
+
+
+def _mark_notification_as_read(*, notification_id: int, user_email: str) -> str | None:
+    normalized = _normalize_email(user_email)
+    if not normalized:
+        return "Ugyldig bruker."
+    try:
+        with db_session() as db:
+            row = db.get(InAppNotification, int(notification_id))
+            if row is None:
+                return "Varslet finnes ikke."
+            if _normalize_email(row.recipient_email) != normalized:
+                return "Du har ikke tilgang til dette varslet."
+            if not bool(row.is_read):
+                row.is_read = True
+                row.read_at = datetime.now(timezone.utc)
+                _commit_with_retry(db, operation="Oppdatering av varselstatus")
+    except RuntimeError as exc:
+        return str(exc)
+    except SQLAlchemyError as exc:
+        return format_user_error("Kunne ikke oppdatere varsel", exc, fallback="Prøv igjen.")
+    return None
+
+
+def _mark_all_notifications_as_read(user_email: str) -> str | None:
+    normalized = _normalize_email(user_email)
+    if not normalized:
+        return "Ugyldig bruker."
+    try:
+        with db_session() as db:
+            rows = db.scalars(
+                select(InAppNotification).where(
+                    func.lower(InAppNotification.recipient_email) == normalized,
+                    InAppNotification.is_read.is_(False),
+                )
+            ).all()
+            if not rows:
+                return None
+            timestamp = datetime.now(timezone.utc)
+            for row in rows:
+                row.is_read = True
+                row.read_at = timestamp
+            _commit_with_retry(db, operation="Oppdatering av varselstatus")
+    except RuntimeError as exc:
+        return str(exc)
+    except SQLAlchemyError as exc:
+        return format_user_error("Kunne ikke oppdatere varsler", exc, fallback="Prøv igjen.")
+    return None
+
+
+def _notification_outbox_status_counts() -> dict[str, int]:
+    counts = {"pending": 0, "failed": 0, "delivered": 0}
+    with db_session() as db:
+        rows = db.execute(
+            select(NotificationOutboxEvent.status, func.count(NotificationOutboxEvent.id)).group_by(
+                NotificationOutboxEvent.status
+            )
+        ).all()
+    for status, amount in rows:
+        normalized_status = str(status or "").strip().casefold()
+        if normalized_status in counts:
+            counts[normalized_status] = int(amount or 0)
+    counts["total"] = sum(int(value) for value in counts.values())
+    return counts
+
+
+def _list_notification_outbox_rows(*, status: str | None, limit: int = 20) -> list[NotificationOutboxEvent]:
+    max_rows = max(1, min(200, int(limit)))
+    with db_session() as db:
+        query = select(NotificationOutboxEvent).order_by(NotificationOutboxEvent.id.desc()).limit(max_rows)
+        if status:
+            query = query.where(NotificationOutboxEvent.status == str(status).strip().casefold())
+        return list(db.scalars(query).all())
+
+
+def _run_notification_outbox_now(*, max_items: int = 300) -> str | None:
+    try:
+        with db_session() as db:
+            _dispatch_notification_outbox(db, max_items=max_items)
+            _commit_with_retry(db, operation="Kjøring av varselkø")
+    except RuntimeError as exc:
+        return str(exc)
+    except SQLAlchemyError as exc:
+        return format_user_error("Kunne ikke kjøre varselkø", exc, fallback="Prøv igjen.")
+    return None
+
+
+def _resend_failed_notification_outbox(*, max_rows: int = 200) -> tuple[int, str | None]:
+    max_count = max(1, min(500, int(max_rows)))
+    try:
+        with db_session() as db:
+            failed_rows = list(
+                db.scalars(
+                    select(NotificationOutboxEvent)
+                    .where(NotificationOutboxEvent.status == "failed")
+                    .order_by(NotificationOutboxEvent.id.asc())
+                    .limit(max_count)
+                ).all()
+            )
+            if not failed_rows:
+                return 0, None
+            now = datetime.now(timezone.utc)
+            for row in failed_rows:
+                row.status = "pending"
+                row.attempts = 0
+                row.last_error = None
+                row.delivered_at = None
+                row.updated_at = now
+            _dispatch_notification_outbox(db, max_items=max_count * 2)
+            _commit_with_retry(db, operation="Resend av feilede varsler")
+            return len(failed_rows), None
+    except RuntimeError as exc:
+        return 0, str(exc)
+    except SQLAlchemyError as exc:
+        return 0, format_user_error("Kunne ikke sende feilede varsler på nytt", exc, fallback="Prøv igjen.")
+
+
+def _render_notification_outbox_admin_sidebar(*, user: dict[str, str], prefix: str) -> None:
+    if str(user.get("role") or "").strip().casefold() != "admin":
+        return
+    if not _is_entra_session(user):
+        with st.sidebar.expander("Varselkø", expanded=False):
+            st.caption("Varselkø er tilgjengelig kun for admin med Entra-innlogging.")
+        return
+
+    counts = _notification_outbox_status_counts()
+    with st.sidebar.expander("Varselkø", expanded=False):
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Pending", int(counts.get("pending", 0)))
+        c2.metric("Failed", int(counts.get("failed", 0)))
+        c3.metric("Delivered", int(counts.get("delivered", 0)))
+        st.caption(f"Totalt i outbox: {int(counts.get('total', 0))}")
+
+        action_left, action_right = st.columns(2)
+        with action_left:
+            run_now_clicked = st.button(
+                "Kjør kø nå",
+                key=f"{prefix}_outbox_run_now",
+                use_container_width=True,
+            )
+        with action_right:
+            resend_clicked = st.button(
+                "Resend feilede",
+                key=f"{prefix}_outbox_resend_failed",
+                use_container_width=True,
+                disabled=int(counts.get("failed", 0)) <= 0,
+            )
+
+        if run_now_clicked:
+            run_error = _run_notification_outbox_now(max_items=500)
+            if run_error:
+                st.error(run_error)
+            else:
+                st.success("Varselkø kjørt.")
+            st.rerun()
+
+        if resend_clicked:
+            resent_count, resend_error = _resend_failed_notification_outbox(max_rows=500)
+            if resend_error:
+                st.error(resend_error)
+            elif resent_count <= 0:
+                st.info("Ingen feilede varsler å sende på nytt.")
+            else:
+                st.success(f"Forsøkte resend av {resent_count} feilede varsler.")
+            st.rerun()
+
+        failed_rows = _list_notification_outbox_rows(status="failed", limit=10)
+        if failed_rows:
+            st.caption("Siste feilede")
+            for row in failed_rows:
+                st.write(
+                    f"#{row.id} | {row.channel} | {row.recipient_email} | bug #{row.bug_id or '-'} | "
+                    f"attempts {int(row.attempts or 0)}"
+                )
+                if row.last_error:
+                    st.caption(str(row.last_error)[:220])
+        else:
+            st.caption("Ingen feilede varsler.")
+
+        st.divider()
+        st.caption("SMTP OAuth2 diagnose")
+        diag_button = st.button(
+            "Kjør SMTP OAuth2 diagnose",
+            key=f"{prefix}_smtp_oauth2_diagnose_run",
+            use_container_width=True,
+        )
+        diag_state_key = f"{prefix}_smtp_oauth2_diagnose_result"
+        if diag_button:
+            st.session_state[diag_state_key] = _run_smtp_oauth2_diagnostic()
+            st.rerun()
+
+        diag_result = st.session_state.get(diag_state_key)
+        if isinstance(diag_result, Mapping):
+            st.caption(f"Sist kjørt: {diag_result.get('generated_at') or '-'}")
+            status_icon = {"ok": "OK", "warn": "WARN", "fail": "FAIL", "info": "INFO"}
+            for item in list(diag_result.get("results") or []):
+                if not isinstance(item, Mapping):
+                    continue
+                state = str(item.get("status") or "info").strip().casefold()
+                icon = status_icon.get(state, "INFO")
+                title = str(item.get("title") or "").strip()
+                detail = str(item.get("detail") or "").strip()
+                st.write(f"[{icon}] {title}: {detail}")
+            summary = diag_result.get("summary")
+            if isinstance(summary, Mapping):
+                st.caption("Diagnose-detajler")
+                st.code(
+                    json.dumps(
+                        {
+                            "auth_method": summary.get("auth_method"),
+                            "email_enabled": summary.get("email_enabled"),
+                            "oauth2_ready": summary.get("oauth2_ready"),
+                            "smtp_host": summary.get("smtp_host"),
+                            "smtp_port": summary.get("smtp_port"),
+                            "smtp_use_tls": summary.get("smtp_use_tls"),
+                            "smtp_use_ssl": summary.get("smtp_use_ssl"),
+                            "oauth2_scope": summary.get("oauth2_scope"),
+                            "oauth2_tenant_id": summary.get("oauth2_tenant_id_masked"),
+                            "oauth2_client_id": summary.get("oauth2_client_id_masked"),
+                            "oauth2_username": summary.get("oauth2_username"),
+                            "smtp_auth_attempted": summary.get("smtp_auth_attempted"),
+                            "token_claims": summary.get("token_claims"),
+                            "token_fetch_error": summary.get("token_fetch_error"),
+                            "smtp_probe_error": summary.get("smtp_probe_error"),
+                        },
+                        ensure_ascii=False,
+                        indent=2,
+                        default=str,
+                    ),
+                    language="json",
+                )
+
+
+def _render_in_app_notifications_sidebar(*, user: dict[str, str], prefix: str) -> None:
+    notifications_enabled = _notifications_enabled_for_user(user)
+    email_enabled = _notification_email_enabled()
+    if notifications_enabled:
+        try:
+            with db_session() as db:
+                _dispatch_notification_outbox(db, max_items=500)
+                _commit_with_retry(db, operation="Oppdatering av varselkø")
+        except Exception as exc:
+            logger.warning("Could not drain notification outbox in sidebar: %s", exc.__class__.__name__)
+
+    unread_count = _count_unread_notifications(user["email"]) if notifications_enabled else 0
+    label = f"Varsler ({unread_count})" if unread_count > 0 else "Varsler"
+    with st.sidebar.expander(label, expanded=False):
+        if not notifications_enabled:
+            st.caption("Varsler er tilgjengelig kun for Entra-innlogging.")
+            return
+        st.caption("Rollebaserte hendelser for dine bugs og tildelinger.")
+        st.caption("Kanaler: In-app + e-post" if email_enabled else "Kanaler: In-app (e-post er ikke aktivert).")
+        unread_only = st.checkbox(
+            "Kun uleste",
+            key=f"{prefix}_notifications_unread_only",
+            value=True,
+        )
+        limit = st.selectbox(
+            "Antall",
+            options=[10, 20, 50],
+            index=1,
+            key=f"{prefix}_notifications_limit",
+        )
+        top_left, top_right = st.columns(2)
+        with top_left:
+            if st.button("Oppdater", key=f"{prefix}_notifications_refresh", use_container_width=True):
+                st.rerun()
+        with top_right:
+            if st.button(
+                "Marker alle lest",
+                key=f"{prefix}_notifications_mark_all",
+                use_container_width=True,
+                disabled=unread_count <= 0,
+            ):
+                error = _mark_all_notifications_as_read(user["email"])
+                if error:
+                    st.error(error)
+                else:
+                    st.success("Alle varsler er markert som lest.")
+                    st.rerun()
+
+        notifications = _list_notifications_for_user(
+            user_email=user["email"],
+            unread_only=bool(unread_only),
+            limit=int(limit),
+        )
+        if not notifications:
+            st.caption("Ingen varsler å vise.")
+            return
+
+        for row in notifications:
+            bullet = "🔵" if not bool(row.is_read) else "⚪"
+            bug_text = f"Bug #{row.bug_id}" if row.bug_id else "System"
+            st.write(f"{bullet} {bug_text} - {row.title}")
+            st.caption(f"{format_datetime_display(row.created_at)} | {row.message}")
+            if not bool(row.is_read):
+                if st.button(
+                    "Marker lest",
+                    key=f"{prefix}_notification_mark_read_{row.id}",
+                    use_container_width=True,
+                ):
+                    error = _mark_notification_as_read(notification_id=int(row.id), user_email=user["email"])
+                    if error:
+                        st.error(error)
+                    else:
+                        st.rerun()
 
 
 def _current_user() -> dict[str, str] | None:
@@ -3327,7 +6121,22 @@ def _current_user() -> dict[str, str] | None:
     role = str(st.session_state.get("role") or "").strip()
     if not email or not role:
         return None
-    return {"email": email, "role": role}
+    auth_provider = str(st.session_state.get("auth_provider") or "").strip().casefold()
+    if not auth_provider:
+        if bool(getattr(st.user, "is_logged_in", False)):
+            oidc_email = str(getattr(st.user, "email", "") or "").strip().casefold()
+            if oidc_email and oidc_email == email.casefold():
+                auth_provider = "entra"
+        if not auth_provider:
+            try:
+                with db_session() as db:
+                    db_user = db.get(User, email.casefold())
+                    auth_provider = str(getattr(db_user, "auth_provider", "") or "").strip().casefold()
+            except Exception:
+                auth_provider = ""
+        if auth_provider:
+            st.session_state["auth_provider"] = auth_provider
+    return {"email": email, "role": role, "auth_provider": auth_provider}
 
 
 def _set_user(email: str) -> None:
@@ -3341,49 +6150,59 @@ def _set_user(email: str) -> None:
         return
     st.session_state["email"] = email
     st.session_state["role"] = role
+    st.session_state["auth_provider"] = "entra"
+
+
+def _is_entra_session(user: dict[str, str] | None = None) -> bool:
+    current = user or _current_user()
+    if not current:
+        return False
+    auth_provider = str(current.get("auth_provider") or "").strip().casefold()
+    if auth_provider == "entra":
+        return True
+    if bool(getattr(st.user, "is_logged_in", False)):
+        oidc_email = str(getattr(st.user, "email", "") or "").strip().casefold()
+        return bool(oidc_email and oidc_email == str(current.get("email", "")).strip().casefold())
+    return False
+
+
+def _devops_access_state(user: dict[str, str] | None = None) -> tuple[bool, str]:
+    current_user = user or _current_user() or {}
+    role = str(current_user.get("role") or "").strip().casefold()
+    if role not in {"admin", "assignee"}:
+        return False, "DevOps er kun tilgjengelig for Assignee og Admin."
+    enabled = _devops_ui_enabled()
+    if not enabled:
+        return False, "DevOps-integrasjon er slått av. Aktiver den i Admin -> DevOps-innstillinger."
+    if not _is_entra_session(current_user):
+        return False, "DevOps krever Entra-innlogging. Test/lokal innlogging er sperret for DevOps."
+    return True, ""
+
+
+def _devops_admin_manage_access_state(user: dict[str, str] | None = None) -> tuple[bool, str]:
+    current_user = user or _current_user() or {}
+    role = str(current_user.get("role") or "").strip().casefold()
+    if role != "admin":
+        return False, "Kun admin kan konfigurere DevOps-innstillinger."
+    if not _is_entra_session(current_user):
+        return False, "DevOps-innstillinger krever Entra-innlogging. Test/lokal innlogging er sperret."
+    return True, ""
 
 
 def _ensure_test_login_user() -> None:
-    enable_test_login = str(_config_value("CLOUD_TEST_ENABLE_TEST_LOGIN", "true")).strip().casefold() in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }
+    enable_test_login, test_login_email, test_login_password = _resolve_test_login_settings()
     if not enable_test_login:
         return
-    test_login_email = _normalize_email(_config_value("CLOUD_TEST_LOCAL_TEST_EMAIL", "admin@example.com"))
-    test_login_password = _config_value("CLOUD_TEST_LOCAL_TEST_PASSWORD", "admin123")
     if not _is_valid_email(test_login_email) or not test_login_password:
         return
     try:
-        with db_session() as db:
-            user = db.get(User, test_login_email)
-            if user is None:
-                db.add(
-                    User(
-                        email=test_login_email,
-                        full_name="Local Test Admin",
-                        password_hash=get_password_hash(test_login_password),
-                        role="admin",
-                        auth_provider="local",
-                    )
-                )
-                _commit_with_retry(db, operation="Oppretting av testbruker")
-                return
-
-            changed = False
-            if str(user.role or "").strip().casefold() != "admin":
-                user.role = "admin"
-                changed = True
-            if str(user.auth_provider or "").strip().casefold() != "local":
-                user.auth_provider = "local"
-                changed = True
-            if not verify_password(test_login_password, str(user.password_hash or "")):
-                user.password_hash = get_password_hash(test_login_password)
-                changed = True
-            if changed:
-                _commit_with_retry(db, operation="Oppdatering av testbruker")
+        _upsert_test_login_user(
+            email=test_login_email,
+            password=test_login_password,
+            force_password_refresh=False,
+            create_operation="Oppretting av testbruker",
+            update_operation="Oppdatering av testbruker",
+        )
     except Exception as exc:
         logger.warning("Failed to ensure test login user: %s", exc)
 
@@ -3402,12 +6221,12 @@ def _auth_gate() -> bool:
         "user_model": User,
         "logger": logger,
     }
+    enable_test_login, test_login_email, test_login_password = _resolve_test_login_settings()
     extended_kwargs = {
         **base_kwargs,
-        "local_default_email": _config_value("CLOUD_TEST_LOCAL_TEST_EMAIL", "admin@example.com"),
-        "local_default_password": _config_value("CLOUD_TEST_LOCAL_TEST_PASSWORD", "admin123"),
-        "enable_test_login": str(_config_value("CLOUD_TEST_ENABLE_TEST_LOGIN", "true")).strip().casefold()
-        in {"1", "true", "yes", "on"},
+        "local_default_email": test_login_email or "admin@example.com",
+        "local_default_password": test_login_password or "admin123",
+        "enable_test_login": enable_test_login,
     }
     try:
         return _render_auth_gate(**extended_kwargs)
@@ -3454,6 +6273,7 @@ _ADVANCED_SIDEBAR_SECTIONS: dict[str, list[str]] = {
         "Lagrede filter",
         "AI-innstillinger",
         "System og drift",
+        "Varsler",
         "Eksport",
         "TODO",
     ],
@@ -3462,6 +6282,7 @@ _ADVANCED_SIDEBAR_SECTIONS: dict[str, list[str]] = {
         "Lagrede filter",
         "AI-innstillinger",
         "System og drift",
+        "Varsler",
         "Arbeidskø-filtre",
         "Arbeidskø",
         "Mulige duplikater",
@@ -3473,11 +6294,14 @@ _ADVANCED_SIDEBAR_SECTIONS: dict[str, list[str]] = {
         "Lagrede filter",
         "AI-innstillinger",
         "System og drift",
+        "Varselkø",
+        "Varsler",
         "Arbeidskø-filtre",
         "Admin-filtrering",
         "Arbeidskø",
         "Mulige duplikater",
         "Eksport",
+        "DevOps-innstillinger",
         "Admin-tilganger",
         "TODO",
     ],
@@ -3523,14 +6347,16 @@ def _sidebar_should_render(prefix: str, section_name: str) -> bool:
     return selected == "Alle" or selected == section_name
 
 
-def _prepare_page_bug_list(*, user: dict[str, str], prefix: str) -> list[Bug]:
-    bugs = _load_bugs_for_user_cached(user)
+def _search_label_for_prefix(prefix: str) -> str:
     search_labels = {
         "reporter": "Søk i dine bugs (vektorsøk)",
         "assignee": "Søk i bugs (vektorsøk)",
         "admin": "Søk i bugs (vektorsøk)",
     }
-    query = render_sidebar_search(prefix, label=search_labels.get(prefix, "Søk i bugs (vektorsøk)"))
+    return search_labels.get(prefix, "Søk i bugs (vektorsøk)")
+
+
+def _render_page_sidebar_sections(*, user: dict[str, str], prefix: str, bugs: list[Bug]) -> bool:
     _render_sidebar_advanced_controller(prefix)
     show_filtering = _sidebar_should_render(prefix, "Filtrering")
     if show_filtering:
@@ -3541,44 +6367,61 @@ def _prepare_page_bug_list(*, user: dict[str, str], prefix: str) -> list[Bug]:
         _render_ai_and_embedding_sidebar_settings(prefix=prefix)
     if _sidebar_should_render(prefix, "System og drift"):
         _render_system_and_ops_sidebar(jobs=_background_jobs_snapshot(), telemetry=_runtime_performance_snapshot())
+    if prefix == "admin" and _sidebar_should_render(prefix, "Varselkø"):
+        _render_notification_outbox_admin_sidebar(user=user, prefix=prefix)
+    if _sidebar_should_render(prefix, "Varsler"):
+        _render_in_app_notifications_sidebar(user=user, prefix=prefix)
+    return show_filtering
 
-    candidate_bugs = bugs
-    vector_search_active = False
-    if query:
-        search_settings = _current_search_settings()
-        started = time.perf_counter()
-        try:
-            with db_session() as db:
-                db_user = _get_or_create_user(db, email=user["email"], role=user["role"])
-                semantic_results = search_visible_bugs(
-                    db,
-                    current_user=db_user,
-                    query=query,
-                    limit=200,
-                    embedding_provider=search_settings["embedding_provider"],
-                    embedding_model=search_settings["embedding_model"],
-                )
-            candidate_bugs = semantic_results
-            vector_search_active = True
-            st.caption(f"Viser vektorsøk-resultater for: {query}")
-        except (SQLAlchemyError, DetachedInstanceError, RuntimeError, ValueError) as exc:
-            logger.warning(
-                "Vector search failed for prefix=%s query_len=%s error=%s",
-                prefix,
-                len(query),
-                exc.__class__.__name__,
+
+def _run_page_vector_search(*, user: dict[str, str], prefix: str, query: str, bugs: list[Bug]) -> tuple[list[Bug], bool]:
+    if not query:
+        return bugs, False
+    search_settings = _current_search_settings()
+    started = time.perf_counter()
+    try:
+        with db_session() as db:
+            db_user = _get_or_create_user(db, email=user["email"], role=user["role"])
+            semantic_results = search_visible_bugs(
+                db,
+                current_user=db_user,
+                query=query,
+                limit=200,
+                embedding_provider=search_settings["embedding_provider"],
+                embedding_model=search_settings["embedding_model"],
             )
-            st.warning(format_user_error("Vektorsøk feilet", exc, fallback="Bruker lokal søkefallback i denne visningen."))
-        finally:
-            elapsed_ms = (time.perf_counter() - started) * 1000.0
-            _record_runtime_metric(f"search_{prefix}_ms", elapsed_ms)
+        st.caption(f"Viser vektorsøk-resultater for: {query}")
+        return semantic_results, True
+    except (SQLAlchemyError, DetachedInstanceError, RuntimeError, ValueError) as exc:
+        logger.warning(
+            "Vector search failed for prefix=%s query_len=%s error=%s",
+            prefix,
+            len(query),
+            exc.__class__.__name__,
+        )
+        st.warning(format_user_error("Vektorsøk feilet", exc, fallback="Bruker lokal søkefallback i denne visningen."))
+        return bugs, False
+    finally:
+        elapsed_ms = (time.perf_counter() - started) * 1000.0
+        _record_runtime_metric(f"search_{prefix}_ms", elapsed_ms)
+
+
+def _reset_filter_state_for_hidden_filtering(prefix: str) -> None:
+    st.session_state[f"{prefix}_filter_status_mode"] = "all"
+    st.session_state[f"{prefix}_filter_severity"] = []
+    st.session_state[f"{prefix}_filter_tags"] = []
+    st.session_state[f"{prefix}_sort_mode"] = "Nyeste først"
+
+
+def _prepare_page_bug_list(*, user: dict[str, str], prefix: str) -> list[Bug]:
+    bugs = _load_bugs_for_user_cached(user)
+    query = render_sidebar_search(prefix, label=_search_label_for_prefix(prefix))
+    show_filtering = _render_page_sidebar_sections(user=user, prefix=prefix, bugs=bugs)
+    candidate_bugs, vector_search_active = _run_page_vector_search(user=user, prefix=prefix, query=query, bugs=bugs)
 
     st.session_state[f"{prefix}_vector_search_active"] = vector_search_active
     if not show_filtering:
-        st.session_state[f"{prefix}_filter_status_mode"] = "all"
-        st.session_state[f"{prefix}_filter_severity"] = []
-        st.session_state[f"{prefix}_filter_tags"] = []
-        st.session_state[f"{prefix}_sort_mode"] = "Nyeste først"
+        _reset_filter_state_for_hidden_filtering(prefix)
     filtered_bugs = apply_sidebar_bug_filters(
         bugs=candidate_bugs,
         prefix=prefix,
@@ -3729,7 +6572,7 @@ def _create_bug(
                         uploaded_by=user["email"],
                     )
                 )
-            _write_history(
+            created_history = _write_history(
                 db,
                 bug_id=bug.id,
                 actor_email=user["email"],
@@ -3744,6 +6587,15 @@ def _create_bug(
                     action="attachment_warning",
                     details=" | ".join(upload_errors)[:1000],
                 )
+            db.flush()
+            _emit_notifications_for_bug_created(
+                db,
+                bug=bug,
+                actor_email=user["email"],
+                history_id=int(created_history.id) if created_history.id is not None else None,
+                notifications_enabled=_notifications_enabled_for_user(user),
+            )
+            _dispatch_notification_outbox(db)
             _mark_bug_search_index_dirty(db, bug_id=bug.id)
             _commit_with_retry(db, operation="Oppretting av bug")
     except RuntimeError as exc:
@@ -3849,14 +6701,13 @@ def _add_comment(user: dict[str, str], bug_id: int, body: str) -> str | None:
                 return "Bugen er i papirkurv og kan ikke oppdateres."
             if normalize_bug_status(bug.status) == "resolved":
                 return "Bugen er løst og kan ikke oppdateres. Sett status tilbake til Åpen først."
-            db.add(
-                BugComment(
-                    bug_id=bug.id,
-                    author_email=user["email"],
-                    author_role=user["role"],
-                    body=text,
-                )
+            comment_row = BugComment(
+                bug_id=bug.id,
+                author_email=user["email"],
+                author_role=user["role"],
+                body=text,
             )
+            db.add(comment_row)
             _write_history(
                 db,
                 bug_id=bug.id,
@@ -3864,6 +6715,16 @@ def _add_comment(user: dict[str, str], bug_id: int, body: str) -> str | None:
                 action="comment_added",
                 details=text[:400],
             )
+            db.flush()
+            _emit_notifications_for_comment(
+                db,
+                bug=bug,
+                actor_email=user["email"],
+                comment_id=int(comment_row.id) if comment_row.id is not None else None,
+                comment_body=text,
+                notifications_enabled=_notifications_enabled_for_user(user),
+            )
+            _dispatch_notification_outbox(db)
             _mark_bug_search_index_dirty(db, bug_id=bug.id)
             _commit_with_retry(db, operation="Lagring av kommentar")
     except RuntimeError as exc:
@@ -3910,6 +6771,12 @@ def _update_bug(
                 return "Bugen ligger i papirkurv. Gjenopprett bugen før oppdatering."
 
             current_status = normalize_bug_status(bug.status)
+            previous_status = current_status
+            previous_assignee = _normalize_email(bug.assignee_id)
+            previous_severity = str(bug.severity or "").strip().casefold()
+            previous_overdue = False
+            if previous_status != "resolved":
+                previous_overdue = bool(_bug_sla_snapshot(bug).get("overdue"))
             if current_status == "resolved":
                 if status_clean != "open":
                     return "Bugen er løst og kan ikke oppdateres. Sett status tilbake til Åpen først."
@@ -3921,13 +6788,30 @@ def _update_bug(
                     return "Du har ikke rettighet til å gjenåpne løste bugs."
                 bug.status = "open"
                 bug.closed_at = None
-                _write_history(
+                reopened_history = _write_history(
                     db,
                     bug_id=bug.id,
                     actor_email=user["email"],
                     action="reopened",
                     details="Bug satt tilbake til Åpen.",
                 )
+                db.flush()
+                _emit_notifications_for_update(
+                    db,
+                    bug=bug,
+                    actor_email=user["email"],
+                    history_id=int(reopened_history.id) if reopened_history.id is not None else None,
+                    previous_status=previous_status,
+                    previous_assignee=previous_assignee,
+                    previous_severity=previous_severity,
+                    previous_overdue=previous_overdue,
+                    new_status=normalize_bug_status(bug.status),
+                    new_assignee=_normalize_email(bug.assignee_id),
+                    new_severity=str(bug.severity or "").strip().casefold(),
+                    new_overdue=bool(_bug_sla_snapshot(bug).get("overdue")),
+                    notifications_enabled=_notifications_enabled_for_user(user),
+                )
+                _dispatch_notification_outbox(db)
                 _mark_bug_search_index_dirty(db, bug_id=bug.id)
                 _commit_with_retry(db, operation="Gjenåpning av bug")
                 _clear_bug_cache()
@@ -3960,7 +6844,7 @@ def _update_bug(
                 bug.closed_at = datetime.now(timezone.utc)
             if status_clean != "resolved":
                 bug.closed_at = None
-            _write_history(
+            updated_history = _write_history(
                 db,
                 bug_id=bug.id,
                 actor_email=user["email"],
@@ -3970,6 +6854,26 @@ def _update_bug(
                     f"assignee={assignee_clean or '-'}, satisfaction={satisfaction_clean or '-'}"
                 ),
             )
+            db.flush()
+            new_overdue = False
+            if status_clean != "resolved":
+                new_overdue = bool(_bug_sla_snapshot(bug).get("overdue"))
+            _emit_notifications_for_update(
+                db,
+                bug=bug,
+                actor_email=user["email"],
+                history_id=int(updated_history.id) if updated_history.id is not None else None,
+                previous_status=previous_status,
+                previous_assignee=previous_assignee,
+                previous_severity=previous_severity,
+                previous_overdue=previous_overdue,
+                new_status=status_clean,
+                new_assignee=assignee_clean,
+                new_severity=str(severity_clean).strip().casefold(),
+                new_overdue=new_overdue,
+                notifications_enabled=_notifications_enabled_for_user(user),
+            )
+            _dispatch_notification_outbox(db)
             _mark_bug_search_index_dirty(db, bug_id=bug.id)
             _commit_with_retry(db, operation="Oppdatering av bug")
     except RuntimeError as exc:
@@ -4376,7 +7280,13 @@ def main() -> None:
 
     # Keep TODO as the final sidebar block regardless of active page.
     if _sidebar_should_render(selected_prefix, "TODO"):
-        _render_todo_sidebar()
+        devops_allowed, devops_reason = _devops_access_state(user)
+        devops_enabled = _devops_ui_enabled()
+        _render_todo_sidebar(
+            devops_enabled=devops_enabled,
+            devops_allowed=devops_allowed,
+            devops_reason=devops_reason,
+        )
 
 
 if __name__ == "__main__":

@@ -31,7 +31,7 @@ Get-ChildItem -Path $authPendingDir -Filter *.json -ErrorAction SilentlyContinue
 
 [System.Environment]::SetEnvironmentVariable("STREAMLIT_CLOUD_TEST_MODE", "true", "Process")
 [System.Environment]::SetEnvironmentVariable("CLOUD_TEST_ALLOW_LOCAL_LOGIN", "false", "Process")
-[System.Environment]::SetEnvironmentVariable("ENABLE_DEVOPS_IN_UI", "false", "Process")
+[System.Environment]::SetEnvironmentVariable("ENABLE_DEVOPS_IN_UI", "true", "Process")
 [System.Environment]::SetEnvironmentVariable("AI_PROVIDER", "openai", "Process")
 [System.Environment]::SetEnvironmentVariable("EMBEDDING_PROVIDER", "openai", "Process")
 [System.Environment]::SetEnvironmentVariable("STORAGE_DIR", $cloudStorageDir, "Process")

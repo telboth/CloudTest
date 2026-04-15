@@ -64,6 +64,10 @@ def _oidc_config_diagnostics() -> tuple[bool, list[str]]:
             break
 
     issues: list[str] = []
+    if "<" in redirect_uri or ">" in redirect_uri:
+        issues.append("Ugyldig [auth].redirect_uri: placeholder '<...>' må erstattes med faktisk URL.")
+    elif redirect_uri and not redirect_uri.startswith(("http://", "https://")):
+        issues.append("Ugyldig [auth].redirect_uri: må starte med http:// eller https://")
     if not redirect_uri:
         issues.append("Mangler [auth].redirect_uri")
     if not cookie_secret:
@@ -80,6 +84,29 @@ def _oidc_config_diagnostics() -> tuple[bool, list[str]]:
 def _oidc_configured() -> bool:
     configured, _issues = _oidc_config_diagnostics()
     return configured
+
+
+def _resolve_oidc_provider_name() -> str | None:
+    try:
+        auth_cfg = st.secrets.get("auth", {})
+    except Exception:
+        return None
+
+    if not isinstance(auth_cfg, Mapping):
+        return None
+
+    preferred = ("microsoft", "default", "entra")
+    for provider_name in preferred:
+        provider_cfg = auth_cfg.get(provider_name)
+        if not isinstance(provider_cfg, Mapping):
+            continue
+        client_id = str(provider_cfg.get("client_id", "") or "").strip()
+        client_secret = str(provider_cfg.get("client_secret", "") or "").strip()
+        metadata_url = str(provider_cfg.get("server_metadata_url", "") or "").strip()
+        if client_id and client_secret and metadata_url:
+            return provider_name
+
+    return None
 
 
 def _oidc_login_sidebar(
@@ -101,13 +128,23 @@ def _oidc_login_sidebar(
         return
     if bool(getattr(st.user, "is_logged_in", False)):
         email = str(getattr(st.user, "email", "") or "").strip()
-        if email and "email" not in st.session_state:
+        current_email = str(st.session_state.get("email") or "").strip().casefold()
+        current_provider = str(st.session_state.get("auth_provider") or "").strip().casefold()
+        if email and (current_email != email.casefold() or current_provider != "entra"):
             set_user(email.casefold())
             st.rerun()
         return
     if st.sidebar.button("Logg inn med Microsoft", use_container_width=True, key="oidc_login_btn"):
         try:
-            st.login()
+            provider_name = _resolve_oidc_provider_name()
+            if provider_name:
+                try:
+                    st.login(provider=provider_name)
+                except TypeError:
+                    # Backward compatibility with older Streamlit signatures.
+                    st.login()
+            else:
+                st.login()
         except Exception as exc:
             if logger is not None:
                 logger.warning("OIDC login failed: %s", exc)
@@ -139,6 +176,7 @@ def _local_login_sidebar(
                 return False
             st.session_state["email"] = user.email
             st.session_state["role"] = user.role
+            st.session_state["auth_provider"] = "local"
             return True
 
     if enable_test_login:
@@ -188,7 +226,7 @@ def _local_login_sidebar(
 
 def _logout_sidebar(*, logger: Any) -> None:
     if st.sidebar.button("Logg ut", use_container_width=True):
-        for key in ("email", "role"):
+        for key in ("email", "role", "auth_provider"):
             st.session_state.pop(key, None)
         if _oidc_available() and bool(getattr(st.user, "is_logged_in", False)):
             try:
@@ -213,7 +251,11 @@ def render_auth_gate(
     logger: Any = None,
 ) -> bool:
     st.sidebar.subheader("Innlogging")
+    oidc_is_configured = _oidc_configured()
     _oidc_login_sidebar(allow_local_login=allow_local_login, set_user=set_user, logger=logger)
+    # Safety fallback: when OIDC is not configured we still expose test-login
+    # so the app is never locked out in local/dev environments.
+    effective_enable_test_login = bool(enable_test_login or (not oidc_is_configured))
     _local_login_sidebar(
         allow_local_login=allow_local_login,
         db_session=db_session,
@@ -221,7 +263,7 @@ def render_auth_gate(
         user_model=user_model,
         default_email=local_default_email,
         default_password=local_default_password,
-        enable_test_login=enable_test_login,
+        enable_test_login=effective_enable_test_login,
     )
     user = current_user()
     if not user:
