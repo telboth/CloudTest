@@ -51,7 +51,7 @@ _prioritize_cloudtest_on_sys_path()
 
 import streamlit as st
 from sqlalchemy import func, select, text
-from sqlalchemy.exc import OperationalError, SQLAlchemyError
+from sqlalchemy.exc import DatabaseError, OperationalError, SQLAlchemyError
 from sqlalchemy.orm.exc import DetachedInstanceError
 from streamlit.web.server.authlib_tornado_integration import TornadoIntegration
 from ai_client import (
@@ -4663,6 +4663,65 @@ def _recover_orphan_background_jobs() -> None:
         _commit_with_retry(db, operation="Oppdatering av bakgrunnsjobber")
 
 
+def _sqlite_database_path_from_url(database_url: str) -> Path | None:
+    raw_url = str(database_url or "").strip()
+    if not raw_url.casefold().startswith("sqlite:///"):
+        return None
+    path_part = raw_url[len("sqlite:///") :].strip()
+    if not path_part or path_part == ":memory:":
+        return None
+    if os.name == "nt" and re.match(r"^/[A-Za-z]:/", path_part):
+        path_part = path_part[1:]
+    path = Path(path_part)
+    if not path.is_absolute():
+        path = (CLOUD_ROOT / path).resolve()
+    return path
+
+
+def _is_malformed_sqlite_error(exc: Exception) -> bool:
+    if not bool(getattr(settings, "database_is_sqlite", False)):
+        return False
+    text = str(exc or "").strip().casefold()
+    return "database disk image is malformed" in text
+
+
+def _quarantine_malformed_sqlite_database(exc: Exception) -> bool:
+    if not _is_malformed_sqlite_error(exc):
+        return False
+    database_url = str(getattr(settings, "database_url", "") or "").strip()
+    db_path = _sqlite_database_path_from_url(database_url)
+    if db_path is None:
+        return False
+
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
+    candidates = [
+        db_path,
+        db_path.with_name(f"{db_path.name}-wal"),
+        db_path.with_name(f"{db_path.name}-shm"),
+    ]
+    moved_paths: list[str] = []
+    for source in candidates:
+        if not source.exists():
+            continue
+        target = source.with_name(f"{source.name}.corrupt-{timestamp}")
+        try:
+            shutil.move(str(source), str(target))
+            moved_paths.append(str(target))
+        except Exception as move_exc:
+            logger.warning(
+                "Could not quarantine malformed SQLite file: source=%s error=%s",
+                source,
+                move_exc,
+            )
+    if not moved_paths:
+        return False
+    logger.warning(
+        "Malformed SQLite database detected; quarantined files and retrying init. files=%s",
+        ", ".join(moved_paths),
+    )
+    return True
+
+
 def _resolve_test_login_settings() -> tuple[bool, str, str]:
     enabled = _is_truthy(_config_value("CLOUD_TEST_ENABLE_TEST_LOGIN", "true"))
     email = _normalize_email(_config_value("CLOUD_TEST_LOCAL_TEST_EMAIL", "admin@example.com"))
@@ -4707,8 +4766,7 @@ def _upsert_test_login_user(
             _commit_with_retry(db, operation=update_operation)
 
 
-@st.cache_resource
-def _init_local_data() -> bool:
+def _init_local_data_once() -> bool:
     _validate_cloud_database_profile()
     _ensure_postgresql_vector_extension()
     migrations_ok = False
@@ -4760,6 +4818,16 @@ def _init_local_data() -> bool:
             )
             _commit_with_retry(db, operation="Oppretting av lokal admin")
     return True
+
+
+@st.cache_resource
+def _init_local_data() -> bool:
+    try:
+        return _init_local_data_once()
+    except Exception as exc:
+        if _quarantine_malformed_sqlite_database(exc):
+            return _init_local_data_once()
+        raise
 
 
 @contextmanager

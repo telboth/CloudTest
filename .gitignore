@@ -4,7 +4,10 @@ storage/
 *.exe
 *.pptx
 bug_tracker.db
+bug_tracker_cloud.db
 bug_tracker_cloud.db-shm
 bug_tracker_cloud.db-wal
+*.db-shm
+*.db-wal
 __pycache__/
 *.pyc
